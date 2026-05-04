@@ -27,7 +27,8 @@ class OverlayAppDetector {
     // MARK: - State Tracking
 
     /// Callback when overlay visibility changes
-    var onOverlayVisibilityChanged: ((Bool) -> Void)?
+    /// Parameters: (isVisible: Bool, overlayName: String?) - overlayName is provided on close for Smart Switch
+    var onOverlayVisibilityChanged: ((Bool, String?) -> Void)?
 
     /// Previous overlay visibility state (for change detection)
     private var wasOverlayVisible = false
@@ -85,6 +86,18 @@ class OverlayAppDetector {
     /// Arm a probe immediately for the next isOverlayAppVisible() call.
     /// Use for OPEN signals: modifier keys, Cmd+keyDown — overlay may appear
     /// before the next keyDown arrives.
+    // MARK: - Overlay Name to Bundle ID Mapping
+    
+    /// Map overlay app name to bundle ID (single source of truth)
+    static func bundleId(forOverlayName name: String) -> String? {
+        switch name {
+        case "Spotlight": return "com.apple.Spotlight"
+        case "Raycast": return "com.raycast.macos"
+        case "Alfred": return "com.runningwithcrayons.Alfred"
+        default: return nil
+        }
+    }
+
     func armProbe() {
         probeNeeded = true
         probeDeadline = CFAbsoluteTimeGetCurrent() + Self.probeTimeout
@@ -129,12 +142,13 @@ class OverlayAppDetector {
                     
                     if !wasOverlayVisible {
                         wasOverlayVisible = true
-                        onOverlayVisibilityChanged?(true)
+                        onOverlayVisibilityChanged?(true, overlayName)
                     }
                     return true
                 } else if cachedOverlayVisible {
                     // Was visible, now gone — clear cache, disarm
                     // Fixes stale-positive: no more waiting for timer poll
+                    let closingOverlayName = cachedOverlayName  // Capture before clearing
                     cachedOverlayVisible = false
                     cachedOverlayName = nil
                     lastDetectedOverlay = nil
@@ -143,7 +157,7 @@ class OverlayAppDetector {
                     
                     if wasOverlayVisible {
                         wasOverlayVisible = false
-                        onOverlayVisibilityChanged?(false)
+                        onOverlayVisibilityChanged?(false, closingOverlayName)
                     }
                     return false
                 }
@@ -253,6 +267,9 @@ class OverlayAppDetector {
         
         let isCurrentlyVisible = isOverlayVisibleQuiet()
         
+        // Capture overlay name before clearing cache (for Smart Switch save on close)
+        let closingOverlayName = cachedOverlayName
+        
         // Update cached state for hot path consumers (O(1) reads)
         cachedOverlayVisible = isCurrentlyVisible
         cachedOverlayName = isCurrentlyVisible ? lastDetectedOverlay : nil
@@ -263,7 +280,7 @@ class OverlayAppDetector {
             wasOverlayVisible = false
 
             // Notify callback
-            onOverlayVisibilityChanged?(false)
+            onOverlayVisibilityChanged?(false, closingOverlayName)
         }
     }
 

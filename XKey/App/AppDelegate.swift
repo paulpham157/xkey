@@ -1168,7 +1168,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Setup callback for overlay visibility changes
     private func setupOverlayDetectorCallback() {
-        OverlayAppDetector.shared.onOverlayVisibilityChanged = { [weak self] isVisible in
+        OverlayAppDetector.shared.onOverlayVisibilityChanged = { [weak self] isVisible, overlayName in
             guard let self = self else { return }
             
             let detector = AppBehaviorDetector.shared
@@ -1178,7 +1178,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if isVisible {
                 // When overlay opens (hidden → visible):
                 // 1. Detect and set injection method for overlay (Spotlight/Raycast/Alfred)
-                // 2. Enable Vietnamese for overlay unless overlay has its own disable rule
+                // 2. Apply Smart Switch for overlay (restore saved language)
                 // 3. Reset mid-sentence flag (overlay apps start with empty/fresh input)
                 self.debugWindowController?.logEvent("Overlay opened - checking overlay rules")
                 let textMethodName = injectionInfo.textSendingMethod == .chunked ? "Chunked" : "OneByOne"
@@ -1190,16 +1190,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // to protect text in normal apps, but overlay apps always start fresh.
                 // If user clicks into existing text, mouse click handler will set mid-sentence appropriately.
                 self.keyboardHandler?.resetMidSentenceFlag()
-                let overlayName = OverlayAppDetector.shared.getVisibleOverlayAppName() ?? "Overlay"
-                self.debugWindowController?.logEvent("'\(overlayName)' opened → reset mid-sentence flag")
+                let name = overlayName ?? "Overlay"
+                self.debugWindowController?.logEvent("'\(name)' opened → reset mid-sentence flag")
             } else {
                 // When overlay closes (visible → hidden):
                 // 1. Detect and set injection method for the underlying app
-                // 2. Restore language for current app
-                // 3. Set mid-sentence flag (protect text in underlying app)
-                self.debugWindowController?.logEvent("Overlay closed - restoring language for current app")
+                // 2. Save overlay's language (using overlayName from callback, cache is already cleared)
+                // 3. Restore language for current app
+                // 4. Set mid-sentence flag (protect text in underlying app)
+                self.debugWindowController?.logEvent("Overlay closed - saving overlay state, restoring underlying app language")
                 let textMethodName = injectionInfo.textSendingMethod == .chunked ? "Chunked" : "OneByOne"
                 self.debugWindowController?.logEvent("   Injection: \(injectionInfo.method) (\(injectionInfo.description)) [\(textMethodName)] ✓ confirmed")
+                // Save overlay's language BEFORE restoring underlying app
+                // Use overlayName from callback parameter (cache is already cleared at this point)
+                self.saveLanguageForOverlay(overlayName: overlayName)
                 self.restoreLanguageForCurrentApp()
                 
                 // When overlay closes, user returns to previous app where cursor position is unknown.
@@ -1215,7 +1219,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Enable Vietnamese when overlay opens (Spotlight/Raycast/Alfred)
     /// This ensures user can type Vietnamese in overlay, regardless of previous app's rule
     private func enableVietnameseForOverlay() {
-        guard keyboardHandler != nil else { return }
+        guard let handler = keyboardHandler else { return }
         
         // Check Input Source config first - it takes priority
         if let currentSource = InputSourceManager.getCurrentInputSource() {
@@ -1226,7 +1230,51 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         
         let overlayName = OverlayAppDetector.shared.getVisibleOverlayAppName() ?? "Unknown"
-        debugWindowController?.logEvent("Overlay '\(overlayName)' opened - keeping current state")
+        
+        // Smart Switch for overlay: restore saved language for this overlay app
+        guard handler.smartSwitchEnabled else {
+            debugWindowController?.logEvent("Overlay '\(overlayName)' opened - keeping current state (Smart Switch disabled)")
+            return
+        }
+        
+        guard let overlayBundleId = overlayNameToBundleId(overlayName) else {
+            debugWindowController?.logEvent("Overlay '\(overlayName)' opened - keeping current state (unknown bundleId)")
+            return
+        }
+        
+        let currentLanguage = statusBarManager?.viewModel.isVietnameseEnabled == true ? 1 : 0
+        let result = handler.engine.checkSmartSwitchForApp(bundleId: overlayBundleId, currentLanguage: currentLanguage)
+        
+        if result.shouldSwitch {
+            let newEnabled = result.newLanguage == 1
+            statusBarManager?.viewModel.isVietnameseEnabled = newEnabled
+            handler.setVietnamese(newEnabled)
+            debugWindowController?.logEvent("Overlay '\(overlayName)' opened → Smart Switch restored \(newEnabled ? "Vietnamese" : "English")")
+        } else {
+            // App is new or language matches - save current language for overlay
+            handler.engine.saveAppLanguage(bundleId: overlayBundleId, language: currentLanguage)
+            debugWindowController?.logEvent("Overlay '\(overlayName)' opened - keeping current state (\(currentLanguage == 1 ? "Vietnamese" : "English"))")
+        }
+    }
+
+    /// Map overlay app name to bundle ID for Smart Switch
+    private func overlayNameToBundleId(_ name: String) -> String? {
+        return OverlayAppDetector.bundleId(forOverlayName: name)
+    }
+    
+    /// Save current language for the visible overlay app (for Smart Switch)
+    private func saveLanguageForOverlay(overlayName: String? = nil) {
+        guard let handler = keyboardHandler else { return }
+        guard handler.smartSwitchEnabled else { return }
+        
+        // Use provided overlayName (from callback) or fallback to cache query
+        let name = overlayName ?? OverlayAppDetector.shared.getVisibleOverlayAppName()
+        guard let resolvedName = name,
+              let overlayBundleId = overlayNameToBundleId(resolvedName) else { return }
+        
+        let currentLanguage = statusBarManager?.viewModel.isVietnameseEnabled == true ? 1 : 0
+        handler.engine.saveAppLanguage(bundleId: overlayBundleId, language: currentLanguage)
+        debugWindowController?.logEvent("Smart Switch: Saved overlay '\(resolvedName)' → \(currentLanguage == 1 ? "Vietnamese" : "English")")
     }
 
     /// Restore language for the current frontmost app from Smart Switch
@@ -1289,6 +1337,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if !inputSourceEnabled {
                 return
             }
+        }
+        
+        // Skip if overlay is visible — overlay Smart Switch is handled by setupOverlayDetectorCallback
+        // This avoids redundant double-fire when Raycast/Alfred become frontmost app
+        if OverlayAppDetector.shared.isOverlayAppVisible() {
+            debugWindowController?.logEvent("Smart Switch: Skipped (overlay app active)")
+            return
         }
         
         // Get the new active app

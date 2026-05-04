@@ -71,12 +71,16 @@ class StatusBarViewModel: ObservableObject {
         // Check if an overlay app (Spotlight/Raycast/Alfred) is currently visible
         if OverlayAppDetector.shared.isOverlayAppVisible() {
             if let overlayName = OverlayAppDetector.shared.getVisibleOverlayAppName() {
-                log("Smart Switch: Skipping save (overlay app '\(overlayName)' is active)")
-            } else {
-                log("Smart Switch: Skipping save (overlay app detected)")
+                // Save language for the overlay app itself (not the underlying app)
+                let overlayBundleId = overlayNameToBundleId(overlayName)
+                if let bundleId = overlayBundleId {
+                    let language = isVietnameseEnabled ? 1 : 0
+                    handler.engine.saveAppLanguage(bundleId: bundleId, language: language)
+                    log("📝 Smart Switch: Saved overlay '\(overlayName)' (\(bundleId)) → \(isVietnameseEnabled ? "Vietnamese" : "English")")
+                } else {
+                    log("Smart Switch: Overlay '\(overlayName)' has unknown bundleId, skipping save")
+                }
             }
-            // Don't save language preference when overlay is active
-            // This prevents overwriting the underlying app's language setting
             return
         }
 
@@ -85,6 +89,11 @@ class StatusBarViewModel: ObservableObject {
         let language = isVietnameseEnabled ? 1 : 0
         handler.engine.saveAppLanguage(bundleId: bundleId, language: language)
         log("📝 Smart Switch: Saved '\(bundleId)' → \(isVietnameseEnabled ? "Vietnamese" : "English")")
+    }
+
+    /// Map overlay app name to bundle ID for Smart Switch
+    private func overlayNameToBundleId(_ name: String) -> String? {
+        return OverlayAppDetector.bundleId(forOverlayName: name)
     }
     
     func selectInputMethod(_ method: InputMethod) {
