@@ -1067,6 +1067,18 @@ struct InjectionTestTabView: View {
                             }
                         }
                         .toggleStyle(.checkbox)
+                        
+                        // Auto Advance Toggle
+                        Toggle(isOn: $viewModel.injectionTestAutoAdvance) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Auto Advance")
+                                    .font(.system(size: 10))
+                                Text("Auto-cycle through all methods + text sending combinations")
+                                    .font(.system(size: 9))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .toggleStyle(.checkbox)
                     }
                     .padding(.top, 4)
                     .disabled(viewModel.injectionTestState != .idle && 

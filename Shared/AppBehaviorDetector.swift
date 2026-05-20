@@ -114,12 +114,16 @@ struct InjectionMethodInfo {
     /// - Content area: U+202F is invisible → extra backspace removes it
     let needsEmptyCharPrefix: Bool
     
-    init(method: InjectionMethod, delays: InjectionDelays, textSendingMethod: TextSendingMethod, description: String, needsEmptyCharPrefix: Bool = false) {
+    /// Configuration for paste text sending method (only used when textSendingMethod == .paste)
+    let pasteConfig: PasteConfig
+    
+    init(method: InjectionMethod, delays: InjectionDelays, textSendingMethod: TextSendingMethod, description: String, needsEmptyCharPrefix: Bool = false, pasteConfig: PasteConfig = PasteConfig()) {
         self.method = method
         self.delays = delays
         self.textSendingMethod = textSendingMethod
         self.description = description
         self.needsEmptyCharPrefix = needsEmptyCharPrefix
+        self.pasteConfig = pasteConfig
     }
     
     static let defaultFast = InjectionMethodInfo(
@@ -135,11 +139,13 @@ struct InjectionMethodInfo {
 enum TextSendingMethod: String, Codable, CaseIterable {
     case chunked = "chunked"      // Send multiple chars per CGEvent (faster, default)
     case oneByOne = "oneByOne"    // Send one char at a time (for Safari/Google Docs compatibility)
+    case paste = "paste"          // Use clipboard + Cmd+V (for TUI apps that drop CGEvent Unicode)
     
     var displayName: String {
         switch self {
         case .chunked: return "Chunked (Nhanh)"
         case .oneByOne: return "Từng ký tự (Chậm hơn nhưng an toàn hơn)"
+        case .paste: return "Paste (Clipboard)"
         }
     }
     
@@ -147,8 +153,67 @@ enum TextSendingMethod: String, Codable, CaseIterable {
         switch self {
         case .chunked: return "Gửi nhiều ký tự cùng lúc, nhanh hơn"
         case .oneByOne: return "Gửi từng ký tự một, tương thích tốt hơn với Safari/Google Docs"
+        case .paste: return "Dùng clipboard + Cmd+V, cho TUI apps bị drop ký tự"
         }
     }
+}
+
+/// Configuration for clipboard paste text sending method
+/// Allows customizing paste behavior per-app (TUI CLIs, remote desktop, etc.)
+struct PasteConfig: Codable {
+    /// Delay after setting clipboard, before sending paste key (microseconds)
+    /// Ensures pasteboard server has committed the data
+    var prePasteDelay: UInt32 = 3000  // 3ms default
+    
+    /// Delay after sending paste key, waiting for app to read clipboard (microseconds)
+    /// Must be long enough for the app to process paste, but short enough to avoid tap timeout
+    var postPasteDelay: UInt32 = 20000  // 20ms default
+    
+    /// Whether to use CGEvent.post (true) or tapPostEvent (false) for the paste key
+    /// true = same path as backspaces (prevents reordering in terminals)
+    /// false = tapPostEvent (better for some apps that need normal event pipeline)
+    var useDirectPost: Bool = true
+    
+    /// Whether to skip the settle time after paste (paste already has its own wait)
+    var skipSettleTime: Bool = true
+    
+    /// Key code for paste shortcut (default: 0x09 = 'v' key)
+    var pasteKeyCode: UInt16 = 0x09
+    
+    /// Modifier flags for paste shortcut (default: Cmd)
+    /// Use CGEventFlags raw values for Codable compatibility
+    var pasteModifierRawValue: UInt64 = CGEventFlags.maskCommand.rawValue
+    
+    /// Computed property for CGEventFlags
+    var pasteModifiers: CGEventFlags {
+        return CGEventFlags(rawValue: pasteModifierRawValue)
+    }
+    
+    /// Preset for TUI apps (Kiro CLI, Claude Code, etc.)
+    static let tuiApp = PasteConfig(
+        prePasteDelay: 3000,    // 3ms
+        postPasteDelay: 20000,  // 20ms
+        useDirectPost: true,
+        skipSettleTime: true
+    )
+    
+    /// Preset for remote desktop apps (higher delays for network latency)
+    static let remoteDesktop = PasteConfig(
+        prePasteDelay: 10000,   // 10ms
+        postPasteDelay: 50000,  // 50ms
+        useDirectPost: true,
+        skipSettleTime: true
+    )
+    
+    /// Preset for remote desktop with Ctrl+V (Windows remote)
+    static let remoteDesktopCtrlV = PasteConfig(
+        prePasteDelay: 10000,   // 10ms
+        postPasteDelay: 50000,  // 50ms
+        useDirectPost: true,
+        skipSettleTime: true,
+        pasteKeyCode: 0x09,     // 'v' key
+        pasteModifierRawValue: CGEventFlags.maskControl.rawValue  // Ctrl instead of Cmd
+    )
 }
 
 // MARK: - Window Title-Based Detection
@@ -210,6 +275,9 @@ struct MergedRuleResult {
     /// Text sending method (nil = use default/auto-detect)
     var textSendingMethod: TextSendingMethod?
     
+    /// Override: Paste configuration (nil = use default)
+    var pasteConfig: PasteConfig?
+    
     /// Enable AXManualAccessibility for Electron/Chromium apps
     var enableForceAccessibility: Bool?
     
@@ -241,6 +309,7 @@ struct MergedRuleResult {
         if let value = rule.injectionMethod { injectionMethod = value }
         if let value = rule.injectionDelays { injectionDelays = value }
         if let value = rule.textSendingMethod { textSendingMethod = value }
+        if let value = rule.pasteConfig { pasteConfig = value }
         if let value = rule.enableForceAccessibility { enableForceAccessibility = value }
         if let value = rule.targetInputSourceId { targetInputSourceId = value }
         if let value = rule.description { description = value }
@@ -307,6 +376,9 @@ struct WindowTitleRule: Codable, Identifiable {
     
     /// Override: Text sending method (nil = use default/auto-detect)
     let textSendingMethod: TextSendingMethod?
+    
+    /// Override: Paste configuration for .paste text sending method (nil = use default)
+    let pasteConfig: PasteConfig?
     
     /// Override: Enable AXManualAccessibility for Electron/Chromium apps
     /// When enabled, XKey will set AXManualAccessibility = true when this app is focused
@@ -428,7 +500,7 @@ struct WindowTitleRule: Codable, Identifiable {
         case axRolePattern, axDescriptionPattern, axIdentifierPattern, axDOMClassList
         // Behavior overrides
         case useMarkedText, hasMarkedTextIssues, commitDelay
-        case injectionMethod, injectionDelays, textSendingMethod
+        case injectionMethod, injectionDelays, textSendingMethod, pasteConfig
         case enableForceAccessibility, targetInputSourceId, description
     }
     
@@ -453,6 +525,7 @@ struct WindowTitleRule: Codable, Identifiable {
         commitDelay = try container.decodeIfPresent(UInt32.self, forKey: .commitDelay)
         injectionDelays = try container.decodeIfPresent([UInt32].self, forKey: .injectionDelays)
         textSendingMethod = try container.decodeIfPresent(TextSendingMethod.self, forKey: .textSendingMethod)
+        pasteConfig = try container.decodeIfPresent(PasteConfig.self, forKey: .pasteConfig)
         enableForceAccessibility = try container.decodeIfPresent(Bool.self, forKey: .enableForceAccessibility)
         targetInputSourceId = try container.decodeIfPresent(String.self, forKey: .targetInputSourceId)
         description = try container.decodeIfPresent(String.self, forKey: .description)
@@ -494,6 +567,7 @@ struct WindowTitleRule: Codable, Identifiable {
         try container.encodeIfPresent(commitDelay, forKey: .commitDelay)
         try container.encodeIfPresent(injectionDelays, forKey: .injectionDelays)
         try container.encodeIfPresent(textSendingMethod, forKey: .textSendingMethod)
+        try container.encodeIfPresent(pasteConfig, forKey: .pasteConfig)
         try container.encodeIfPresent(enableForceAccessibility, forKey: .enableForceAccessibility)
         try container.encodeIfPresent(targetInputSourceId, forKey: .targetInputSourceId)
         try container.encodeIfPresent(description, forKey: .description)
@@ -533,6 +607,7 @@ struct WindowTitleRule: Codable, Identifiable {
         injectionMethod: InjectionMethod? = nil,
         injectionDelays: [UInt32]? = nil,
         textSendingMethod: TextSendingMethod? = nil,
+        pasteConfig: PasteConfig? = nil,
         enableForceAccessibility: Bool? = nil,
         targetInputSourceId: String? = nil,
         description: String? = nil
@@ -555,6 +630,7 @@ struct WindowTitleRule: Codable, Identifiable {
         self.injectionMethod = injectionMethod
         self.injectionDelays = injectionDelays
         self.textSendingMethod = textSendingMethod
+        self.pasteConfig = pasteConfig
         self.enableForceAccessibility = enableForceAccessibility
         self.targetInputSourceId = targetInputSourceId
         self.description = description
@@ -765,10 +841,30 @@ class AppBehaviorDetector {
             bundleIdPattern: "",  // Match all browsers
             titlePattern: "Telegram",
             matchMode: .contains,
-            injectionMethod: .slow,
-            injectionDelays: [3000, 6000, 3000],
+            injectionMethod: .selection,
+            injectionDelays: [3000, 8000, 3000],
             textSendingMethod: .oneByOne,
-            description: "Telegram Web (all browsers) - slow oneByOne to bypass popup interception"
+            description: "Telegram Web (all browsers) - selection method to avoid popup dismiss on backspace"
+        ),
+        
+        // ============================================
+        // TUI-based CLI tools (Kiro, Claude Code, etc.)
+        // ============================================
+        
+        // TUI frameworks (ink/Node.js, etc.) process input via async event loop.
+        // Chunked text sending (multiple chars in 1 CGEvent) causes characters to be
+        // dropped because the TUI only processes part of the multi-char event.
+        // Fix: oneByOne text sending + higher wait delay between backspaces and text.
+        WindowTitleRule(
+            name: "Kiro CLI",
+            bundleIdPattern: "",  // Match any terminal app
+            titlePattern: "kiro",
+            matchMode: .contains,
+            injectionMethod: .slow,
+            injectionDelays: [8000, 25000, 5000],  // bs: 8ms, wait: 25ms, text: ignored for paste
+            textSendingMethod: .paste,
+            pasteConfig: .tuiApp,
+            description: "Kiro CLI (TUI) - clipboard paste to bypass CGEvent Unicode drop"
         ),
     ]
 
@@ -2019,12 +2115,16 @@ class AppBehaviorDetector {
 
             // Get text sending method from merged result, default to chunked
             let textMethod = mergedResult.textSendingMethod ?? .chunked
+            
+            // Get paste config from merged result, default to standard config
+            let paste = mergedResult.pasteConfig ?? PasteConfig()
 
             return InjectionMethodInfo(
                 method: injectionMethod,
                 delays: delays,
                 textSendingMethod: textMethod,
-                description: mergedResult.displayName
+                description: mergedResult.displayName,
+                pasteConfig: paste
             )
         }
 

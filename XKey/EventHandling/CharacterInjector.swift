@@ -228,12 +228,18 @@ class CharacterInjector {
             case .chunked:
                 debugCallback?("    → Text mode: chunked, directPost=\(useDirectPost)")
                 sendTextChunkedInternal(fullString, delay: delays.text, proxy: proxy, useDirectPost: useDirectPost)
+            case .paste:
+                debugCallback?("    → Text mode: paste (clipboard + Cmd+V)")
+                sendTextViaPaste(fullString, proxy: proxy, config: methodInfo.pasteConfig)
             }
         }
         
-        // Settle time
-        let settleTime: UInt32 = (method == .slow) ? 20000 : 5000
-        usleep(settleTime)
+        // Settle time (skip if paste config says so)
+        let shouldSkipSettle = (textSendingMethod == .paste && methodInfo.pasteConfig.skipSettleTime)
+        if !shouldSkipSettle {
+            let settleTime: UInt32 = (method == .slow) ? 20000 : 5000
+            usleep(settleTime)
+        }
         
         debugCallback?("injectSync: complete")
     }
@@ -313,6 +319,9 @@ class CharacterInjector {
             case .chunked:
                 debugCallback?("    → Text mode: chunked (directPost=true)")
                 sendTextChunkedInternal(text, delay: delays.text, proxy: proxy, useDirectPost: true)
+            case .paste:
+                debugCallback?("    → Text mode: paste (directPost=true)")
+                sendTextViaPaste(text, proxy: proxy, config: PasteConfig(useDirectPost: true))
             }
         }
         
@@ -642,12 +651,17 @@ class CharacterInjector {
             sendTextOneByOne(fullString, delay: delays.text, proxy: proxy)
         case .chunked:
             sendTextChunked(fullString, delay: delays.text, proxy: proxy)
+        case .paste:
+            debugCallback?("    → Text mode: paste (clipboard + Cmd+V)")
+            sendTextViaPaste(fullString, proxy: proxy, config: methodInfo.pasteConfig)
         }
         
-        // Settle time: adaptive based on method
-        // Reduced from 20ms to 8ms for slow apps thanks to semaphore sync
-        let settleTime: UInt32 = (method == .slow) ? 8000 : 3000
-        usleep(settleTime)
+        // Settle time: skip if paste config says so
+        let shouldSkipSettle = (textSendingMethod == .paste && methodInfo.pasteConfig.skipSettleTime)
+        if !shouldSkipSettle {
+            let settleTime: UInt32 = (method == .slow) ? 8000 : 3000
+            usleep(settleTime)
+        }
     }
 
     // MARK: - AX Helpers (shared boilerplate for cursor queries)
@@ -849,6 +863,36 @@ class CharacterInjector {
     private func sendTextOneByOne(_ text: String, delay: UInt32, proxy: CGEventTapProxy) {
         // Use the internal version with useDirectPost = false
         sendTextOneByOneInternal(text, delay: delay, proxy: proxy, useDirectPost: false)
+    }
+    
+    /// Send text via clipboard paste (Cmd+V)
+    /// Used for TUI apps (like Kiro CLI) that drop CGEvent Unicode characters.
+    /// The terminal wraps pasted text in bracketed paste sequences (\e[200~...\e[201~),
+    /// ensuring the TUI receives all text atomically in a single paste event.
+    ///
+    /// NOTE: Clipboard is NOT restored after paste to avoid race conditions when typing fast.
+    /// (Next user Cmd+C will overwrite naturally)
+    private func sendTextViaPaste(_ text: String, proxy: CGEventTapProxy, config: PasteConfig = PasteConfig()) {
+        let pasteboard = NSPasteboard.general
+        
+        // Set clipboard to replacement text
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+        
+        debugCallback?("    → Paste: set clipboard = '\(text)'")
+        
+        // Wait for pasteboard server to commit data
+        usleep(config.prePasteDelay)
+        
+        // Send paste key (Cmd+V or Ctrl+V depending on config)
+        sendKeyPress(CGKeyCode(config.pasteKeyCode), proxy: proxy, useDirectPost: config.useDirectPost, modifiers: config.pasteModifiers)
+        
+        debugCallback?("    → Paste: sent paste key (directPost=\(config.useDirectPost))")
+        
+        // Wait for app to read clipboard and process paste
+        usleep(config.postPasteDelay)
+        
+        debugCallback?("    → Paste: done")
     }
     
     // MARK: - Private Methods

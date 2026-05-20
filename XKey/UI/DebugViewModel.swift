@@ -1227,6 +1227,10 @@ class DebugViewModel: ObservableObject {
     /// Whether to auto-clear text after test fail (default: true)
     @Published var injectionTestAutoClear = true
     
+    /// Whether to auto-advance to next method/text sending combination after each test
+    /// When false, test stops after each attempt and user must manually run next test
+    @Published var injectionTestAutoAdvance = true
+    
     /// Index of current method in the test sequence
     @Published var injectionTestMethodIndex = 0
     
@@ -1320,8 +1324,12 @@ class DebugViewModel: ObservableObject {
         addInjectionTestLog("=== INJECTION TEST ===")
         addInjectionTestLog("Input: \(injectionTestInput)")
         addInjectionTestLog("Expected: \(injectionTestExpected)")
-        addInjectionTestLog("Starting method: \(injectionTestCurrentMethod.displayName)")
-        addInjectionTestLog("Will try \(injectionMethodsToTest.count - injectionTestMethodIndex) method(s)")
+        addInjectionTestLog("Starting method: \(injectionTestCurrentMethod.displayName) + \(injectionTestTextSendingMethod.rawValue)")
+        if injectionTestAutoAdvance {
+            addInjectionTestLog("Auto-advance: ON — will try \(injectionMethodsToTest.count - injectionTestMethodIndex) method(s) × 2 text modes")
+        } else {
+            addInjectionTestLog("Auto-advance: OFF — testing single combination only")
+        }
         addInjectionTestLog("")
         
         // Start countdown
@@ -1700,6 +1708,25 @@ class DebugViewModel: ObservableObject {
     
     /// Try the next text sending method, or move to next injection method if both tried
     private func tryNextTextSendingMethod() {
+        // If auto-advance is disabled, stop here and let user decide
+        if !injectionTestAutoAdvance {
+            injectionTestState = .completed
+            setForceOverride(enabled: false)
+            
+            addInjectionTestLog("")
+            addInjectionTestLog("[AUTO-ADVANCE OFF] Test stopped.")
+            addInjectionTestLog("Change method/text sending manually and run again.")
+            
+            // Show result for this single test
+            let lastResult = injectionTestResults.last
+            if let result = lastResult {
+                injectionTestResult = result.passed 
+                    ? "✓ \(result.method.displayName) + \(result.textMode.rawValue) PASSED"
+                    : "✗ \(result.method.displayName) + \(result.textMode.rawValue) FAILED"
+            }
+            return
+        }
+        
         // If currently chunked, try oneByOne
         if injectionTestTextSendingMethod == .chunked {
             injectionTestTextSendingMethod = .oneByOne
