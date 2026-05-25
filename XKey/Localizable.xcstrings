@@ -8626,6 +8626,150 @@
         }
       }
     },
+    "iCloud đã có dữ liệu thiết lập sẵn": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "iCloud already has existing settings"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "iCloud 上已有现有设置"
+          }
+        }
+      }
+    },
+    "Gộp local + iCloud": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Merge local + iCloud"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "合并本地与 iCloud"
+          }
+        }
+      }
+    },
+    "Dùng dữ liệu trên iCloud (ghi đè local)": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Use iCloud data (overwrite local)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "使用 iCloud 数据（覆盖本地）"
+          }
+        }
+      }
+    },
+    "Đẩy local lên iCloud (ghi đè cloud)": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Push local to iCloud (overwrite cloud)"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "将本地推送到 iCloud（覆盖云端）"
+          }
+        }
+      }
+    },
+    "Dữ liệu hiện có trên iCloud: %@. Hãy chọn cách xử lý.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Data currently on iCloud: %@. Choose how to handle it."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "iCloud 上的数据：%@。请选择处理方式。"
+          }
+        }
+      }
+    },
+    "Tổng dung lượng: %@ / %lld MB": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Total size: %@ / %lld MB"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "总大小：%@ / %lld MB"
+          }
+        }
+      }
+    },
+    "Bản XKey mới hơn đã ghi data này": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "A newer XKey version wrote this data"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "较新版本的 XKey 写入了此数据"
+          }
+        }
+      }
+    },
+    "Ứng dụng loại trừ": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Excluded apps"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "排除的应用"
+          }
+        }
+      }
+    },
+    "Dung lượng iCloud vượt giới hạn — xem chi tiết bên dưới": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "iCloud storage limit exceeded — see details below"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "iCloud 存储超出限制 — 请查看下方详情"
+          }
+        }
+      }
+    },
     "Đồng bộ thiết lập qua iCloud": {
       "localizations": {
         "en": {
@@ -8894,6 +9038,38 @@
           "stringUnit": {
             "state": "translated",
             "value": "iCloud 同步"
+          }
+        }
+      }
+    },
+    "iCloud Sync không khả dụng": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "iCloud Sync unavailable"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "iCloud 同步不可用"
+          }
+        }
+      }
+    },
+    "Vui lòng đăng nhập iCloud và bật iCloud Drive trên máy này. Trên macOS 26+, một số phiên bản phân phối ngoài App Store có thể tạm thời không hỗ trợ iCloud Sync.": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Please sign in to iCloud and enable iCloud Drive on this Mac. On macOS 26+, some non-App Store distributions may temporarily not support iCloud Sync."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "请在本机登录 iCloud 并启用 iCloud Drive。在 macOS 26+ 上，部分非 App Store 分发版本可能暂不支持 iCloud 同步。"
           }
         }
       }

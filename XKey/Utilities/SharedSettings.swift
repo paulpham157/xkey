@@ -899,16 +899,22 @@ class SharedSettings {
     
     /// Add a word to the user dictionary
     func addUserDictionaryWord(_ word: String) {
+        let normalized = word.lowercased().trimmingCharacters(in: .whitespaces)
         var words = getUserDictionaryWords()
-        words.insert(word.lowercased().trimmingCharacters(in: .whitespaces))
+        words.insert(normalized)
         setUserDictionaryWords(words)
+        // Re-adding a previously deleted word clears its tombstone so the addition isn't
+        // shadowed on next sync.
+        SyncTombstoneStore.shared.remove(category: .userDict, id: normalized)
     }
-    
+
     /// Remove a word from the user dictionary
     func removeUserDictionaryWord(_ word: String) {
+        let normalized = word.lowercased().trimmingCharacters(in: .whitespaces)
         var words = getUserDictionaryWords()
-        words.remove(word.lowercased().trimmingCharacters(in: .whitespaces))
+        words.remove(normalized)
         setUserDictionaryWords(words)
+        SyncTombstoneStore.shared.record(category: .userDict, id: normalized)
     }
     
     /// Check if a word exists in the user dictionary
@@ -965,22 +971,45 @@ class SharedSettings {
         )
     }
     
-    // MARK: - iCloud Sync Helpers
+    // MARK: - iCloud Sync Helpers (per-category)
 
-    func exportSettingsForSync() -> Data? {
-        let dict = readPlistDict()
+    /// Keys excluded from the scalar payload because they are owned by dedicated sync categories
+    /// (macros / rules / excluded apps / user dictionary). Keeping them out prevents double-writes.
+    private static let scalarsExcludedKeys: Set<String> = [
+        SharedSettingsKey.macrosData.rawValue,
+        SharedSettingsKey.excludedApps.rawValue,
+        SharedSettingsKey.windowTitleRules.rawValue,
+        SharedSettingsKey.userDictionaryWords.rawValue,
+    ]
+
+    /// Sensitive keys that must never leave the device. Currently empty — translation providers
+    /// do not store API keys in the shared plist — but kept as a defensive scaffold.
+    private static let sensitiveScalarKeys: Set<String> = []
+
+    // MARK: Scalars
+
+    func exportScalarsForSync() -> Data? {
+        var dict = readPlistDict()
+        for k in Self.scalarsExcludedKeys { dict.removeValue(forKey: k) }
+        for k in Self.sensitiveScalarKeys { dict.removeValue(forKey: k) }
         guard !dict.isEmpty else { return nil }
         return try? PropertyListSerialization.data(fromPropertyList: dict, format: .binary, options: 0)
     }
 
-    func importSettingsForSync(from data: Data) {
-        guard let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return }
+    func importScalarsForSync(from data: Data) {
+        guard let incoming = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else { return }
+
+        var merged = readPlistDict()
+        let preserve = Self.scalarsExcludedKeys.union(Self.sensitiveScalarKeys)
+        for (k, v) in incoming where !preserve.contains(k) {
+            merged[k] = v
+        }
 
         isBatchUpdating = true
-        writePlistDict(dict)
+        writePlistDict(merged)
         isBatchUpdating = false
 
-        if let langRaw = dict[SharedSettingsKey.appLanguage.rawValue] as? String,
+        if let langRaw = merged[SharedSettingsKey.appLanguage.rawValue] as? String,
            AppLanguage(rawValue: langRaw) != nil {
             UserDefaults.standard.set(langRaw, forKey: "appLanguage")
         }
@@ -991,6 +1020,109 @@ class SharedSettings {
         NotificationCenter.default.post(name: .translationSettingsDidChange, object: nil)
         NotificationCenter.default.post(name: .translationToolbarSettingsDidChange, object: nil)
         NotificationCenter.default.post(name: .debugSettingsDidChange, object: nil)
+    }
+
+    // MARK: Macros
+    //
+    // List helpers operate on the raw JSON Data already persisted in the plist so they don't depend
+    // on model types that may not exist in every build target (e.g. MacroItem is UI-only).
+
+    func snapshotMacrosForSync(timestampProvider: (String, Data) -> Date) -> [SyncEntry] {
+        Self.jsonArraySnapshot(getMacrosData(), idField: "id", timestampProvider: timestampProvider)
+    }
+
+    func applyMacrosFromSync(liveEntries: [SyncEntry]) {
+        guard let encoded = Self.jsonArrayReassemble(liveEntries) else { return }
+        isBatchUpdating = true
+        setMacrosData(encoded)
+        isBatchUpdating = false
+        notifySettingsChanged()
+    }
+
+    // MARK: Window title rules
+
+    func snapshotRulesForSync(timestampProvider: (String, Data) -> Date) -> [SyncEntry] {
+        Self.jsonArraySnapshot(getWindowTitleRulesData(), idField: "id", timestampProvider: timestampProvider)
+    }
+
+    func applyRulesFromSync(liveEntries: [SyncEntry]) {
+        guard let encoded = Self.jsonArrayReassemble(liveEntries) else { return }
+        isBatchUpdating = true
+        setWindowTitleRulesData(encoded)
+        isBatchUpdating = false
+        notifySettingsChanged()
+    }
+
+    // MARK: Excluded apps
+
+    func snapshotExcludedAppsForSync(timestampProvider: (String, Data) -> Date) -> [SyncEntry] {
+        Self.jsonArraySnapshot(getExcludedApps(), idField: "bundleIdentifier", timestampProvider: timestampProvider)
+    }
+
+    func applyExcludedAppsFromSync(liveEntries: [SyncEntry]) {
+        guard let encoded = Self.jsonArrayReassemble(liveEntries) else { return }
+        isBatchUpdating = true
+        setExcludedApps(encoded)
+        isBatchUpdating = false
+        notifySettingsChanged()
+    }
+
+    // MARK: JSON array helpers
+
+    /// Generic snapshot: read a JSON-encoded array of objects from Data, derive a per-object
+    /// SyncEntry using `idField` as the stable identifier. Skips entries without the field.
+    private static func jsonArraySnapshot(_ data: Data?,
+                                          idField: String,
+                                          timestampProvider: (String, Data) -> Date) -> [SyncEntry] {
+        guard let data = data,
+              let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return array.compactMap { obj in
+            let rawId: String?
+            switch obj[idField] {
+            case let s as String: rawId = s
+            case let uuid as UUID: rawId = uuid.uuidString
+            default: rawId = nil
+            }
+            guard let id = rawId,
+                  let encoded = try? JSONSerialization.data(withJSONObject: obj) else { return nil }
+            return SyncEntry(id: id, updatedAt: timestampProvider(id, encoded), deleted: false, data: encoded)
+        }
+    }
+
+    /// Reassemble live entries into a JSON-encoded array suitable for the original storage slot.
+    private static func jsonArrayReassemble(_ liveEntries: [SyncEntry]) -> Data? {
+        let objects: [[String: Any]] = liveEntries.compactMap { entry in
+            guard let data = entry.data,
+                  let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+            return dict
+        }
+        return try? JSONSerialization.data(withJSONObject: objects)
+    }
+
+    // MARK: User dictionary
+
+    func snapshotUserDictForSync(timestampProvider: (String, Data) -> Date) -> [SyncEntry] {
+        let words = getUserDictionaryWords()
+        return words.map { word in
+            let data = Data(word.utf8)
+            return SyncEntry(id: word, updatedAt: timestampProvider(word, data), deleted: false, data: data)
+        }
+    }
+
+    func applyUserDictFromSync(liveEntries: [SyncEntry]) {
+        let words = Set(liveEntries.compactMap { entry -> String? in
+            guard let data = entry.data,
+                  let word = String(data: data, encoding: .utf8) else { return nil }
+            return word
+        })
+        isBatchUpdating = true
+        if let encoded = try? JSONEncoder().encode(Array(words).sorted()) {
+            writeData(encoded, forKey: SharedSettingsKey.userDictionaryWords.rawValue)
+        }
+        isBatchUpdating = false
+        notifySettingsChanged()
     }
 
     // MARK: - Export/Import Settings

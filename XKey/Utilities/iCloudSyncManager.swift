@@ -2,216 +2,616 @@
 //  iCloudSyncManager.swift
 //  XKey
 //
-//  Syncs settings to/from iCloud via NSUbiquitousKeyValueStore
+//  Multi-key iCloud settings sync with CRDT-lite per-entry merge for list categories.
+//  Replaces the single-blob design from PR #277 — adds:
+//    - per-category KVS keys (each within Apple's 1 MB cap)
+//    - SyncEnvelope wrapper (schemaVersion, deviceId, updatedAt)
+//    - per-entry merge with tombstones for macros / rules / excluded apps / user dictionary
+//    - first-enable detection (no more silent overwrite of cloud data)
+//    - quota pre-check before push
+//    - forward-compat guard against payloads from newer app versions
 //
 
 import Foundation
 
-enum iCloudSyncStatus: Equatable {
-    case disabled
-    case idle
-    case pushing
-    case pulling
-    case synced
-    case error(String)
-}
+// MARK: - Manager
 
-protocol KeyValueStoreProtocol: AnyObject {
-    func data(forKey key: String) -> Data?
-    func setData(_ data: Data?, forKey key: String)
-    @discardableResult func synchronize() -> Bool
-}
+final class iCloudSyncManager: NSObject {
 
-extension NSUbiquitousKeyValueStore: KeyValueStoreProtocol {
-    func setData(_ data: Data?, forKey key: String) {
-        set(data, forKey: key)
-    }
-}
-
-class iCloudSyncManager {
+    // MARK: - Singleton
 
     static let shared = iCloudSyncManager()
 
+    // MARK: - Dependencies
+
     private let kvStore: KeyValueStoreProtocol
-    private let syncKey = "XKey.syncedSettings"
-    private var pushTimer: Timer?
+    private let tombstones: SyncTombstoneStore
+    private let defaults: UserDefaults
+
+    // MARK: - Persistent keys
+
+    private let enabledKey            = "XKey.iCloudSyncEnabled"
+    private let lastSyncDateKey       = "XKey.lastCloudSyncDate"
+    private let hasPushedBeforeKey    = "XKey.sync.hasPushedBefore"
+    private let scalarsLocalUpdatedAtKey = "XKey.sync.scalars.localUpdatedAt"
+    private let entrySigPrefix        = "XKey.sync.entrySig."
+
+    // MARK: - Mutable state
+
+    private var perCategoryStatus: [SyncCategory: SyncCategoryStatus] = [:]
+    private var pushTimers: [SyncCategory: Timer] = [:]
+    private var dirtyCategories: Set<SyncCategory> = []
     private var isPulling = false
     private var isObserving = false
+    private var awaitingFirstEnableDecision = false
 
-    private let enabledKey = "XKey.iCloudSyncEnabled"
+    private let pushDebounce: TimeInterval = 2.0
 
-    private(set) var status: iCloudSyncStatus = .disabled
+    // MARK: - Init
+
+    override private init() {
+        self.kvStore = NSUbiquitousKeyValueStore.default
+        self.tombstones = .shared
+        self.defaults = .standard
+        super.init()
+    }
+
+    init(store: KeyValueStoreProtocol,
+         tombstones: SyncTombstoneStore = .shared,
+         defaults: UserDefaults = .standard) {
+        self.kvStore = store
+        self.tombstones = tombstones
+        self.defaults = defaults
+        super.init()
+    }
+
+    // MARK: - Availability
+
+    /// True when ubiquity-kvstore-identifier entitlement present and KVS reachable.
+    /// Developer ID release builds on macOS 26+ omit the entitlement (runtime SIGKILL otherwise).
+    /// synchronize() returns false when entitlement absent — safe to call always.
+    static var isKVSAvailable: Bool {
+        NSUbiquitousKeyValueStore.default.synchronize()
+    }
+
+    // MARK: - Public state
 
     var isEnabled: Bool {
-        get { UserDefaults.standard.bool(forKey: enabledKey) }
+        get { defaults.bool(forKey: enabledKey) }
         set {
+            guard Self.isKVSAvailable else { return }
             let wasEnabled = isEnabled
-            UserDefaults.standard.set(newValue, forKey: enabledKey)
+            defaults.set(newValue, forKey: enabledKey)
             if newValue && !wasEnabled {
-                status = .idle
-                startObserving()
-                pushToCloud()
+                handleEnable()
             } else if !newValue && wasEnabled {
-                stopObserving()
-                status = .disabled
-                notifyStatusChanged()
+                handleDisable()
             }
         }
     }
 
     var lastSyncDate: Date? {
-        UserDefaults.standard.object(forKey: "XKey.lastCloudSyncDate") as? Date
+        defaults.object(forKey: lastSyncDateKey) as? Date
     }
 
+    /// Total bytes across all category keys.
     var syncDataSizeBytes: Int? {
-        kvStore.data(forKey: syncKey)?.count
+        let total = SyncCategory.allCases.reduce(0) { acc, c in
+            acc + (kvStore.data(forKey: c.rawValue)?.count ?? 0)
+        }
+        return total == 0 ? nil : total
     }
 
-    private init() {
-        self.kvStore = NSUbiquitousKeyValueStore.default
+    func bytes(for category: SyncCategory) -> Int? {
+        kvStore.data(forKey: category.rawValue)?.count
     }
 
-    init(store: KeyValueStoreProtocol) {
-        self.kvStore = store
+    /// Aggregated status surfaced to the UI.
+    var status: iCloudSyncStatus {
+        guard isEnabled else { return .disabled }
+        if awaitingFirstEnableDecision { return .idle }
+        let statuses = SyncCategory.allCases.map { perCategoryStatus[$0] ?? .idle }
+        // Quota violation surfaces as an error — the quota meter already shows which category.
+        if statuses.contains(.quotaExceeded) {
+            return .error(String(localized: "Dung lượng iCloud vượt giới hạn — xem chi tiết bên dưới"))
+        }
+        if let firstError = statuses.first(where: {
+            if case .error = $0 { return true } else { return false }
+        }), case .error(let msg) = firstError {
+            return .error(msg)
+        }
+        if statuses.contains(.pulling) { return .pulling }
+        if statuses.contains(.pushing) { return .pushing }
+        if statuses.allSatisfy({
+            if case .synced = $0 { return true } else { return false }
+        }) { return .synced }
+        return .idle
     }
+
+    func categoryStatus(_ category: SyncCategory) -> SyncCategoryStatus {
+        perCategoryStatus[category] ?? .disabled
+    }
+
+    // MARK: - Setup (called from AppDelegate)
 
     func setup() {
-        guard isEnabled else {
-            status = .disabled
+        guard Self.isKVSAvailable else {
+            setAllCategories(.disabled)
             return
         }
-        status = .idle
+        guard isEnabled else {
+            setAllCategories(.disabled)
+            return
+        }
+        startObserving()
+        for c in SyncCategory.allCases { perCategoryStatus[c] = .idle }
+        kvStore.synchronize()
+        // KVS will fire .didChangeExternallyNotification with InitialSyncChange shortly;
+        // do not pre-emptively pull here — let the observer drive it.
+    }
+
+    // MARK: - Enable / disable flow
+
+    private func handleEnable() {
         startObserving()
         kvStore.synchronize()
+
+        let decision = detectFirstEnable()
+        switch decision {
+        case .noRemoteData:
+            for c in SyncCategory.allCases { perCategoryStatus[c] = .idle }
+            if !defaults.bool(forKey: hasPushedBeforeKey) {
+                // True first time — no remote data exists, push local as seed.
+                pushAll()
+                defaults.set(true, forKey: hasPushedBeforeKey)
+            }
+            // On re-enable (hasPushedBefore=true), do NOT push immediately — remote may have
+            // newer data written by another device while this one had sync disabled.
+            // The KVS InitialSyncChange notification fired by kvStore.synchronize() will drive
+            // a pull-merge shortly via kvStoreDidChange.
+            notifyStatusChanged()
+        case .remoteHasData:
+            // Need user to choose. Block automatic push until applyFirstEnableChoice() is called.
+            awaitingFirstEnableDecision = true
+            for c in SyncCategory.allCases { perCategoryStatus[c] = .idle }
+            notifyStatusChanged()
+            postFirstEnablePrompt()
+        }
     }
+
+    private func handleDisable() {
+        stopObserving()
+        setAllCategories(.disabled)
+        awaitingFirstEnableDecision = false
+        notifyStatusChanged()
+    }
+
+    private func detectFirstEnable() -> SyncFirstEnableDecision {
+        if defaults.bool(forKey: hasPushedBeforeKey) {
+            return .noRemoteData  // already initialised; subsequent enables behave normally
+        }
+        let hasRemote = SyncCategory.allCases.contains { c in
+            kvStore.data(forKey: c.rawValue) != nil
+        }
+        return hasRemote ? .remoteHasData : .noRemoteData
+    }
+
+    /// Categories that currently have non-empty remote envelopes. Used by the UI prompt
+    /// so the user knows what data is at stake before picking an action.
+    func categoriesWithRemoteData() -> [SyncCategory] {
+        SyncCategory.allCases.filter { kvStore.data(forKey: $0.rawValue) != nil }
+    }
+
+    /// Resolve the first-enable prompt with the user's choice.
+    func applyFirstEnableChoice(_ action: SyncFirstEnableAction) {
+        guard awaitingFirstEnableDecision else { return }
+        switch action {
+        case .cancel:
+            // User backed out — turn the toggle back off without pushing or pulling.
+            awaitingFirstEnableDecision = false
+            defaults.set(false, forKey: enabledKey)
+            handleDisable()
+            return
+        case .useLocal:
+            awaitingFirstEnableDecision = false
+            pushAll()
+            defaults.set(true, forKey: hasPushedBeforeKey)
+        case .useRemote:
+            awaitingFirstEnableDecision = false
+            pullAllOverwriteLocal()
+            defaults.set(true, forKey: hasPushedBeforeKey)
+        case .merge:
+            awaitingFirstEnableDecision = false
+            mergeAll()
+            defaults.set(true, forKey: hasPushedBeforeKey)
+        }
+        notifyStatusChanged()
+    }
+
+    // MARK: - Push
+
+    /// Manual "Sync now" from the UI.
+    func pushAll() {
+        for c in SyncCategory.allCases { pushCategory(c) }
+    }
+
+    func pushCategory(_ category: SyncCategory) {
+        guard isEnabled, !isPulling, !awaitingFirstEnableDecision else { return }
+        setCategoryStatus(category, .pushing)
+        do {
+            let envelope = try buildOutgoingEnvelope(for: category)
+            let encoded = try envelope.encoded()
+            if encoded.count > category.softQuotaBytes {
+                setCategoryStatus(category, .quotaExceeded)
+                sharedLogWarning("iCloud sync: \(category.rawValue) payload \(encoded.count) B exceeds soft quota — not pushed")
+                notifyStatusChanged()
+                return
+            }
+            kvStore.setData(encoded, forKey: category.rawValue)
+            kvStore.synchronize()
+            defaults.set(Date(), forKey: lastSyncDateKey)
+            setCategoryStatus(category, .synced(Date()))
+            sharedLogSuccess("iCloud sync: pushed \(category.rawValue) (\(encoded.count) B)")
+        } catch {
+            setCategoryStatus(category, .error(error.localizedDescription))
+            sharedLogError("iCloud sync: push failed for \(category.rawValue): \(error)")
+        }
+        notifyStatusChanged()
+    }
+
+    private func buildOutgoingEnvelope(for category: SyncCategory) throws -> SyncEnvelope {
+        if category.usesPerEntryMerge {
+            let liveEntries = snapshotLiveEntries(for: category)
+            let tombstoneEntries = tombstones.tombstoneEntries(for: category)
+            tombstones.prune(category: category)
+            let payload = SyncCollectionPayload(entries: liveEntries + tombstoneEntries)
+                .prunedTombstones(retention: category.tombstoneRetention)
+            return SyncEnvelope(payload: try payload.encoded())
+        } else {
+            // scalars whole-blob
+            let blob = SharedSettings.shared.exportScalarsForSync() ?? Data()
+            let updatedAt = (defaults.object(forKey: scalarsLocalUpdatedAtKey) as? Date) ?? Date()
+            return SyncEnvelope(payload: blob, updatedAt: updatedAt)
+        }
+    }
+
+    // MARK: - Pull
+
+    /// Force pull every category, overwriting local state. Used when user picks "use remote" on first-enable.
+    func pullAllOverwriteLocal() {
+        for c in SyncCategory.allCases {
+            pullCategory(c, mode: .overwriteLocal)
+        }
+    }
+
+    /// Pull every category and merge into local (CRDT for collections, newer-wins for scalars).
+    func pullAll() {
+        for c in SyncCategory.allCases {
+            pullCategory(c, mode: .mergeWithLocal)
+        }
+    }
+
+    private enum PullMode { case mergeWithLocal, overwriteLocal }
+
+    private func pullCategory(_ category: SyncCategory, mode: PullMode) {
+        guard let data = kvStore.data(forKey: category.rawValue) else {
+            // No remote data — nothing to apply. Mark synced if currently idle.
+            if perCategoryStatus[category] == .idle {
+                setCategoryStatus(category, .synced(Date()))
+                notifyStatusChanged()
+            }
+            return
+        }
+        setCategoryStatus(category, .pulling)
+        do {
+            let envelope = try SyncEnvelope.decode(from: data)
+            guard envelope.isCompatibleWithCurrentSchema else {
+                setCategoryStatus(category, .error(String(localized: "Bản XKey mới hơn đã ghi data này")))
+                notifyStatusChanged()
+                return
+            }
+            // Skip echoes of our own push — initial sync after relaunch can re-deliver the value
+            // this device just wrote, and re-applying it would needlessly churn local state.
+            if envelope.deviceId == SyncDeviceID.current && mode == .mergeWithLocal {
+                setCategoryStatus(category, .synced(Date()))
+                notifyStatusChanged()
+                return
+            }
+            try applyEnvelope(envelope, category: category, mode: mode)
+            defaults.set(Date(), forKey: lastSyncDateKey)
+            setCategoryStatus(category, .synced(Date()))
+            sharedLogSuccess("iCloud sync: pulled \(category.rawValue) (\(data.count) B)")
+        } catch {
+            setCategoryStatus(category, .error(error.localizedDescription))
+            sharedLogError("iCloud sync: pull failed for \(category.rawValue): \(error)")
+        }
+        notifyStatusChanged()
+    }
+
+    private func applyEnvelope(_ envelope: SyncEnvelope, category: SyncCategory, mode: PullMode) throws {
+        let apply = { [weak self] in
+            guard let self = self else { return }
+            self.isPulling = true
+            defer { self.isPulling = false }
+            if category.usesPerEntryMerge {
+                guard let remotePayload = try? SyncCollectionPayload.decode(from: envelope.payload) else { return }
+                let local = SyncCollectionPayload(entries: self.snapshotLiveEntries(for: category))
+                let merged: SyncCollectionPayload
+                switch mode {
+                case .overwriteLocal:
+                    merged = remotePayload
+                case .mergeWithLocal:
+                    merged = local.merged(with: remotePayload)
+                }
+                self.applyCollection(merged, to: category)
+            } else {
+                // scalars whole-blob
+                switch mode {
+                case .overwriteLocal:
+                    SharedSettings.shared.importScalarsForSync(from: envelope.payload)
+                case .mergeWithLocal:
+                    let localTimestamp = (self.defaults.object(forKey: self.scalarsLocalUpdatedAtKey) as? Date) ?? .distantPast
+                    if envelope.updatedAt > localTimestamp {
+                        SharedSettings.shared.importScalarsForSync(from: envelope.payload)
+                        self.defaults.set(envelope.updatedAt, forKey: self.scalarsLocalUpdatedAtKey)
+                    }
+                }
+            }
+        }
+        if Thread.isMainThread {
+            apply()
+        } else {
+            DispatchQueue.main.sync { apply() }
+        }
+    }
+
+    // MARK: - Merge (first-enable "merge" action)
+
+    private func mergeAll() {
+        // For collections: pull-merge, then push the merged result. For scalars: newer timestamp wins.
+        for c in SyncCategory.allCases {
+            pullCategory(c, mode: .mergeWithLocal)
+            pushCategory(c)
+        }
+    }
+
+    // MARK: - Snapshot helpers (delegate to SharedSettings)
+
+    private func snapshotLiveEntries(for category: SyncCategory) -> [SyncEntry] {
+        switch category {
+        case .scalars:
+            return []
+        case .macros:
+            return SharedSettings.shared.snapshotMacrosForSync(timestampProvider: timestampProvider(for: .macros))
+        case .rules:
+            return SharedSettings.shared.snapshotRulesForSync(timestampProvider: timestampProvider(for: .rules))
+        case .excludedApps:
+            return SharedSettings.shared.snapshotExcludedAppsForSync(timestampProvider: timestampProvider(for: .excludedApps))
+        case .userDict:
+            return SharedSettings.shared.snapshotUserDictForSync(timestampProvider: timestampProvider(for: .userDict))
+        }
+    }
+
+    private func applyCollection(_ payload: SyncCollectionPayload, to category: SyncCategory) {
+        let live = payload.liveEntries
+        let remoteTombstones = payload.entries.filter { $0.deleted }
+        switch category {
+        case .scalars:
+            return
+        case .macros:
+            SharedSettings.shared.applyMacrosFromSync(liveEntries: live)
+        case .rules:
+            SharedSettings.shared.applyRulesFromSync(liveEntries: live)
+        case .excludedApps:
+            SharedSettings.shared.applyExcludedAppsFromSync(liveEntries: live)
+        case .userDict:
+            SharedSettings.shared.applyUserDictFromSync(liveEntries: live)
+        }
+        // Adopt remote tombstones preserving their original deletion timestamps so the
+        // 30-day retention window is measured from the actual deletion, not from sync time.
+        for entry in remoteTombstones {
+            tombstones.record(category: category, id: entry.id, at: entry.updatedAt)
+        }
+        tombstones.prune(category: category)
+        refreshEntrySignatures(category: category, liveIDs: Set(live.map { $0.id }))
+    }
+
+    // MARK: - Per-entry timestamps (content-hash based)
+
+    /// Returns a closure SharedSettings calls per entry: given (id, contentData) -> updatedAt.
+    /// Tracks last-seen signature so the timestamp only bumps when the entry actually changed.
+    private func timestampProvider(for category: SyncCategory) -> (String, Data) -> Date {
+        return { [weak self] id, data in
+            guard let self = self else { return Date() }
+            let sig = self.signature(of: data)
+            let sigKey = "\(self.entrySigPrefix)\(category.rawValue).\(id).sig"
+            let dateKey = "\(self.entrySigPrefix)\(category.rawValue).\(id).date"
+            if let prevSig = self.defaults.string(forKey: sigKey),
+               let prevDate = self.defaults.object(forKey: dateKey) as? Date,
+               prevSig == sig {
+                return prevDate
+            }
+            let now = Date()
+            self.defaults.set(sig, forKey: sigKey)
+            self.defaults.set(now, forKey: dateKey)
+            return now
+        }
+    }
+
+    /// Prune signature cache so entries removed locally don't accumulate metadata forever.
+    private func refreshEntrySignatures(category: SyncCategory, liveIDs: Set<String>) {
+        let prefix = "\(entrySigPrefix)\(category.rawValue)."
+        let keys = defaults.dictionaryRepresentation().keys.filter { $0.hasPrefix(prefix) }
+        for key in keys {
+            let suffix = key.dropFirst(prefix.count)
+            let parts = suffix.split(separator: ".")
+            guard parts.count >= 2 else { continue }
+            let id = parts.dropLast().joined(separator: ".")
+            if !liveIDs.contains(id) {
+                defaults.removeObject(forKey: key)
+            }
+        }
+    }
+
+    private func signature(of data: Data) -> String {
+        // Stable 64-bit FNV-1a fingerprint. Swift.Hasher is process-seeded (non-stable across
+        // launches), so we cannot use it — a mismatched signature would reset every entry's
+        // timestamp on every app restart, making CRDT timestamps meaningless.
+        // Collisions are tolerable: we err on the side of a fresher timestamp, not data loss.
+        var hash: UInt64 = 14695981039346656037  // FNV offset basis
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash = hash &* 1099511628211          // FNV prime (overflow-safe)
+        }
+        return String(hash)
+    }
+
+    // MARK: - Observers
 
     private func startObserving() {
         guard !isObserving else { return }
         isObserving = true
-
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(kvStoreDidChange(_:)),
             name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-            object: nil
-        )
-
+            object: nil)
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(localSettingsDidChange),
             name: .sharedSettingsDidChange,
-            object: nil
-        )
+            object: nil)
     }
 
     private func stopObserving() {
         guard isObserving else { return }
         isObserving = false
-
-        NotificationCenter.default.removeObserver(
-            self,
-            name: NSUbiquitousKeyValueStore.didChangeExternallyNotification,
-            object: nil
-        )
-        NotificationCenter.default.removeObserver(
-            self,
-            name: .sharedSettingsDidChange,
-            object: nil
-        )
-        pushTimer?.invalidate()
-        pushTimer = nil
+        NotificationCenter.default.removeObserver(self,
+            name: NSUbiquitousKeyValueStore.didChangeExternallyNotification, object: nil)
+        NotificationCenter.default.removeObserver(self,
+            name: .sharedSettingsDidChange, object: nil)
+        for (_, t) in pushTimers { t.invalidate() }
+        pushTimers.removeAll()
+        dirtyCategories.removeAll()
     }
 
     @objc private func localSettingsDidChange() {
+        guard isEnabled, !isPulling, !awaitingFirstEnableDecision else { return }
+        // Bump scalars timestamp on any local change. Coarse but safe — the manager doesn't
+        // know which category a setting belongs to, so we mark scalars unconditionally and
+        // schedule a push for every list category to recompute signatures.
+        defaults.set(Date(), forKey: scalarsLocalUpdatedAtKey)
+        for c in SyncCategory.allCases { dirtyCategories.insert(c) }
         schedulePush()
     }
 
     private func schedulePush() {
-        guard isEnabled, !isPulling else { return }
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.pushTimer?.invalidate()
-            self.pushTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: false) { [weak self] _ in
-                self?.pushToCloud()
+            for c in self.dirtyCategories {
+                self.pushTimers[c]?.invalidate()
+                self.pushTimers[c] = Timer.scheduledTimer(withTimeInterval: self.pushDebounce, repeats: false) { [weak self] _ in
+                    self?.dirtyCategories.remove(c)
+                    self?.pushCategory(c)
+                }
             }
         }
     }
 
-    func pushToCloud() {
-        guard isEnabled, !isPulling else { return }
-        guard let data = SharedSettings.shared.exportSettingsForSync() else {
-            status = .error(String(localized: "Không thể đọc thiết lập"))
-            notifyStatusChanged()
+    @objc private func kvStoreDidChange(_ notification: Notification) {
+        guard isEnabled, !awaitingFirstEnableDecision else { return }
+        guard let userInfo = notification.userInfo,
+              let reason = userInfo[NSUbiquitousKeyValueStoreChangeReasonKey] as? Int
+        else { return }
+
+        // Account change carries no changedKeys — handle before the keys guard.
+        if reason == NSUbiquitousKeyValueStoreAccountChange {
+            defaults.set(false, forKey: hasPushedBeforeKey)
+            tombstones.clearAll()
+            sharedLogWarning("iCloud account changed — re-sync state cleared")
             return
         }
-        status = .pushing
-        notifyStatusChanged()
-        kvStore.setData(data, forKey: syncKey)
-        kvStore.synchronize()
-        UserDefaults.standard.set(Date(), forKey: "XKey.lastCloudSyncDate")
-        status = .synced
-        sharedLogSuccess("Settings pushed to iCloud (\(data.count) bytes)")
-        notifyStatusChanged()
-    }
 
-    @objc private func kvStoreDidChange(_ notification: Notification) {
-        guard isEnabled else { return }
-
-        guard let userInfo = notification.userInfo,
-              let reason = userInfo[NSUbiquitousKeyValueStoreChangeReasonKey] as? Int,
-              let changedKeys = userInfo[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String] else { return }
-
-        guard changedKeys.contains(syncKey) else { return }
+        guard let changedKeys = userInfo[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String] else { return }
+        let categories = changedKeys.compactMap(SyncCategory.init(rawValue:))
+        guard !categories.isEmpty else { return }
 
         switch reason {
         case NSUbiquitousKeyValueStoreServerChange,
              NSUbiquitousKeyValueStoreInitialSyncChange:
-            pullFromCloud()
+            for c in categories { pullCategory(c, mode: .mergeWithLocal) }
         case NSUbiquitousKeyValueStoreQuotaViolationChange:
-            status = .error(String(localized: "Vượt giới hạn 1MB iCloud"))
-            sharedLogWarning("iCloud KVS quota exceeded — sync paused")
+            for c in categories { setCategoryStatus(c, .quotaExceeded) }
+            sharedLogWarning("iCloud KVS quota exceeded — partial sync paused")
             notifyStatusChanged()
         default:
             break
         }
     }
 
-    func pullFromCloud() {
-        guard let data = kvStore.data(forKey: syncKey) else { return }
+    // MARK: - Export to file (for Backup tab)
 
-        let apply = { [weak self] in
-            guard let self = self else { return }
-            self.isPulling = true
-            self.status = .pulling
-            self.notifyStatusChanged()
-            SharedSettings.shared.importSettingsForSync(from: data)
-            self.isPulling = false
-            UserDefaults.standard.set(Date(), forKey: "XKey.lastCloudSyncDate")
-            self.status = .synced
-            sharedLogSuccess("Settings pulled from iCloud (\(data.count) bytes)")
-            self.notifyStatusChanged()
+    /// Aggregate every category's live payload into a single .plist for the "Export from iCloud" UI.
+    func exportCloudData() -> Data? {
+        var combined: [String: Any] = [:]
+        var any = false
+        for c in SyncCategory.allCases {
+            guard let raw = kvStore.data(forKey: c.rawValue),
+                  let envelope = try? SyncEnvelope.decode(from: raw),
+                  envelope.isCompatibleWithCurrentSchema else { continue }
+            any = true
+            if c.usesPerEntryMerge {
+                if let payload = try? SyncCollectionPayload.decode(from: envelope.payload) {
+                    combined[c.rawValue] = payload.liveEntries.compactMap { $0.data }
+                }
+            } else {
+                if let dict = try? PropertyListSerialization.propertyList(from: envelope.payload, format: nil) as? [String: Any] {
+                    combined[c.rawValue] = dict
+                }
+            }
         }
-
-        if Thread.isMainThread {
-            apply()
-        } else {
-            DispatchQueue.main.async(execute: apply)
-        }
+        guard any else { return nil }
+        return try? PropertyListSerialization.data(fromPropertyList: combined, format: .xml, options: 0)
     }
 
-    func exportCloudData() -> Data? {
-        guard let binary = kvStore.data(forKey: syncKey),
-              let dict = try? PropertyListSerialization.propertyList(from: binary, format: nil) as? [String: Any] else {
-            return nil
-        }
-        return try? PropertyListSerialization.data(fromPropertyList: dict, format: .xml, options: 0)
+    // MARK: - Internal status helpers
+
+    private func setCategoryStatus(_ category: SyncCategory, _ newStatus: SyncCategoryStatus) {
+        perCategoryStatus[category] = newStatus
+    }
+
+    private func setAllCategories(_ newStatus: SyncCategoryStatus) {
+        for c in SyncCategory.allCases { perCategoryStatus[c] = newStatus }
     }
 
     private func notifyStatusChanged() {
         NotificationCenter.default.post(name: .iCloudSyncStatusDidChange, object: nil)
     }
-}
 
-extension Notification.Name {
-    static let iCloudSyncStatusDidChange = Notification.Name("XKey.iCloudSyncStatusDidChange")
+    private func postFirstEnablePrompt() {
+        let names = categoriesWithRemoteData().map { $0.rawValue }
+        NotificationCenter.default.post(
+            name: .iCloudSyncFirstEnablePrompt,
+            object: nil,
+            userInfo: ["categoriesWithRemote": names])
+    }
+
+    // MARK: - Testing hooks
+
+    /// Reset internal state for tests. Wipes both KVS and UserDefaults keys this manager owns.
+    func _resetForTesting() {
+        defaults.removeObject(forKey: enabledKey)
+        defaults.removeObject(forKey: lastSyncDateKey)
+        defaults.removeObject(forKey: hasPushedBeforeKey)
+        defaults.removeObject(forKey: scalarsLocalUpdatedAtKey)
+        for c in SyncCategory.allCases {
+            defaults.removeObject(forKey: c.rawValue)
+            kvStore.setData(nil, forKey: c.rawValue)
+        }
+        tombstones.clearAll()
+        perCategoryStatus.removeAll()
+        dirtyCategories.removeAll()
+        awaitingFirstEnableDecision = false
+        isPulling = false
+    }
 }

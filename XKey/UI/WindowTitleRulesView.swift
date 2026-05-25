@@ -1481,9 +1481,10 @@ class WindowTitleRulesViewModel: ObservableObject {
     
     func addRule(_ rule: WindowTitleRule) {
         AppBehaviorDetector.shared.addCustomRule(rule)
+        SyncTombstoneStore.shared.remove(category: .rules, id: rule.id.uuidString)
         refresh()
     }
-    
+
     func updateRule(_ rule: WindowTitleRule, originalId: UUID?) {
         if let id = originalId {
             // Create new rule with original ID
@@ -1493,9 +1494,10 @@ class WindowTitleRulesViewModel: ObservableObject {
         }
         refresh()
     }
-    
+
     func deleteRule(_ rule: WindowTitleRule) {
         AppBehaviorDetector.shared.removeCustomRule(id: rule.id)
+        SyncTombstoneStore.shared.record(category: .rules, id: rule.id.uuidString)
         refresh()
     }
     

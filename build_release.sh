@@ -17,6 +17,8 @@ ENABLE_NOTARIZE=${ENABLE_NOTARIZE:-false}  # Set to true to enable notarization
 ENABLE_DMG=${ENABLE_DMG:-true}  # Set to false to skip DMG creation
 ENABLE_XKEYIM=${ENABLE_XKEYIM:-true}  # Set to false to skip XKeyIM build
 ENABLE_XKEYIM_BUNDLE=${ENABLE_XKEYIM_BUNDLE:-true}  # Set to false to skip bundling XKeyIM inside XKey.app
+ENABLE_PROFILE_EMBED=${ENABLE_PROFILE_EMBED:-true}  # Set to false to skip embedding Developer ID provisioning profile
+ENABLE_ICLOUD_ENTITLEMENT=${ENABLE_ICLOUD_ENTITLEMENT:-true}  # Diagnostic toggle. Trusts XKeyRelease.entitlements by default. Set false to strip ubiquity-kvstore-identifier from /tmp expanded entitlements before signing (useful only if someone re-adds the entitlement to the file for testing; macOS 26 SIGKILLs Developer ID binaries claiming any iCloud entitlement).
 
 # Smart defaults: If notarizing, assume it's a full release
 if [ "$ENABLE_NOTARIZE" = true ]; then
@@ -137,10 +139,67 @@ echo "📦 Copying to ./Release/XKey.app..."
 rm -rf Release/XKey.app
 cp -R "./build/Build/Products/Release/XKey.app" Release/
 
+# Expand Xcode build variables in entitlements files for codesign re-sign steps.
+# codesign does NOT expand $(TeamIdentifierPrefix) or $(CFBundleIdentifier) —
+# passing raw .entitlements files with these placeholders produces a literal-string
+# entitlement that macOS validates and rejects (SIGKILL / Code Signature Invalid).
+XKEY_ENTITLEMENTS_EXPANDED="/tmp/xkey-release-expanded.entitlements"
+XKEYIM_ENTITLEMENTS_EXPANDED="/tmp/xkeyim-release-expanded.entitlements"
+sed "s/\$(TeamIdentifierPrefix)/${TEAM_ID}./g; s/\$(CFBundleIdentifier)/${BUNDLE_ID}/g" \
+    "XKey/XKeyRelease.entitlements" > "$XKEY_ENTITLEMENTS_EXPANDED"
+sed "s/\$(TeamIdentifierPrefix)/${TEAM_ID}./g; s/\$(CFBundleIdentifier)/com.codetay.inputmethod.XKey/g" \
+    "XKeyIM/XKeyIMRelease.entitlements" > "$XKEYIM_ENTITLEMENTS_EXPANDED" 2>/dev/null || \
+    cp "XKeyIM/XKeyIMRelease.entitlements" "$XKEYIM_ENTITLEMENTS_EXPANDED" 2>/dev/null || true
+
+# Optionally strip ubiquity-kvstore-identifier from XKey entitlements (diagnostic mode)
+if [ "$ENABLE_ICLOUD_ENTITLEMENT" = false ]; then
+    echo "⏭️  Stripping ubiquity-kvstore-identifier from release entitlements (diagnostic)"
+    # Remove both the <key> line and the following <string> line
+    sed -i.bak '/com\.apple\.developer\.ubiquity-kvstore-identifier/,+1d' "$XKEY_ENTITLEMENTS_EXPANDED"
+    rm -f "${XKEY_ENTITLEMENTS_EXPANDED}.bak"
+fi
+
+# Embed the Developer ID Distribution provisioning profile (defensive).
+# Currently no restricted entitlements remain in XKeyRelease.entitlements —
+# ubiquity-kvstore-identifier was removed because macOS 26 SIGKILLs Developer ID
+# binaries that claim any iCloud entitlement at task creation (taskgated/Code
+# Signing Monitor). Toggle ENABLE_ICLOUD_ENTITLEMENT=true to reproduce locally
+# (the entitlement is also stripped from /tmp expanded copy when toggle off).
+# Profile is still embedded so future restricted entitlements (push, deviceCheck)
+# would already have profile authorization. xcodebuild embeds a dev profile (Mac
+# Team) by default; we replace it with the Developer ID Distribution profile.
+XKEY_DEVID_PROFILE="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/XKey_Developer_ID_Distribution.provisionprofile"
+# Fallback: search by name in case UUID-named file
+if [ ! -f "$XKEY_DEVID_PROFILE" ]; then
+    XKEY_DEVID_PROFILE=$(find "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
+        -name "*.provisionprofile" -newer /dev/null 2>/dev/null | while read f; do
+        name=$(security cms -D -i "$f" 2>/dev/null | grep -A1 "<key>Name</key>" | tail -1 | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+        [ "$name" = "XKey Developer ID Distribution" ] && echo "$f" && break
+    done)
+fi
+if [ "$ENABLE_CODESIGN" = true ] && [ "$ENABLE_PROFILE_EMBED" = true ]; then
+    if [ -n "$XKEY_DEVID_PROFILE" ] && [ -f "$XKEY_DEVID_PROFILE" ]; then
+        echo "🔐 Embedding Developer ID Distribution provisioning profile..."
+        cp "$XKEY_DEVID_PROFILE" "Release/XKey.app/Contents/embedded.provisionprofile"
+        echo "✅ Developer ID profile embedded"
+    else
+        echo "⚠️  WARNING: Developer ID Distribution profile not found!"
+        echo "   Notarized builds without this profile will be rejected by amfid."
+        echo "   Create it at: developer.apple.com/account/resources/profiles/add"
+        echo "   Name it 'XKey Developer ID Distribution' and install via Xcode."
+        # Remove dev profile to avoid cert-type mismatch (dev profile + Dev ID cert)
+        rm -f "Release/XKey.app/Contents/embedded.provisionprofile"
+    fi
+elif [ "$ENABLE_CODESIGN" = true ]; then
+    echo "⏭️  Skipping profile embedding (ENABLE_PROFILE_EMBED=false)"
+    # Still strip any profile xcodebuild may have inserted to avoid cert-type mismatch
+    rm -f "Release/XKey.app/Contents/embedded.provisionprofile"
+fi
+
 # Sign Sparkle framework's nested components (IMPORTANT: must be done before signing main app)
-if [ "$ENABLE_CODESIGN" = true ]; then
+if [ "$ENABLE_CODESIGN" = true ] && [ "$ENABLE_SPARKLE_SIGN" = true ]; then
     echo "🔐 Signing Sparkle framework components..."
-    
+
     SPARKLE_FW="Release/XKey.app/Contents/Frameworks/Sparkle.framework/Versions/B"
     
     # Sign XPC Services first (deepest level)
@@ -201,14 +260,14 @@ if [ "$ENABLE_CODESIGN" = true ]; then
     codesign --force --sign "$DEVELOPER_ID" \
         --timestamp \
         --options=runtime \
-        --entitlements "XKey/XKeyRelease.entitlements" \
+        --entitlements "$XKEY_ENTITLEMENTS_EXPANDED" \
         Release/XKey.app
     echo "✅ XKey.app re-signed"
 else
     # Ad-hoc sign with correct identifier (required for Accessibility permissions)
     # IMPORTANT: Include entitlements to preserve App Group for data sharing
     echo "🔐 Ad-hoc signing with correct bundle identifier..."
-    codesign --force --sign - --identifier "$BUNDLE_ID" --entitlements "XKey/XKeyRelease.entitlements" Release/XKey.app
+    codesign --force --sign - --identifier "$BUNDLE_ID" --entitlements "$XKEY_ENTITLEMENTS_EXPANDED" Release/XKey.app
     echo "✅ Ad-hoc signed with identifier: $BUNDLE_ID"
 fi
 
@@ -295,10 +354,10 @@ if [ "$ENABLE_XKEYIM" = true ]; then
         # Re-sign after modifying Info.plist
         if [ "$ENABLE_CODESIGN" = true ]; then
             echo "🔐 Re-signing XKeyIM after Info.plist update..."
-            codesign --force --sign "$DEVELOPER_ID" --timestamp --options=runtime --entitlements "XKeyIM/XKeyIMRelease.entitlements" "Release/XKeyIM.app"
+            codesign --force --sign "$DEVELOPER_ID" --timestamp --options=runtime --entitlements "$XKEYIM_ENTITLEMENTS_EXPANDED" "Release/XKeyIM.app"
         else
             echo "🔐 Ad-hoc signing XKeyIM with entitlements..."
-            codesign --force --sign - --identifier "$XKEYIM_BUNDLE_ID" --entitlements "XKeyIM/XKeyIMRelease.entitlements" Release/XKeyIM.app
+            codesign --force --sign - --identifier "$XKEYIM_BUNDLE_ID" --entitlements "$XKEYIM_ENTITLEMENTS_EXPANDED" Release/XKeyIM.app
         fi
         
         # Verify signature
@@ -317,9 +376,9 @@ if [ "$ENABLE_XKEYIM" = true ]; then
             # IMPORTANT: Must include --entitlements to preserve App Group for data sharing
             echo "🔐 Re-signing XKey.app after embedding XKeyIM..."
             if [ "$ENABLE_CODESIGN" = true ]; then
-                codesign --force --sign "$DEVELOPER_ID" --timestamp --options=runtime --entitlements "XKey/XKeyRelease.entitlements" "Release/XKey.app"
+                codesign --force --sign "$DEVELOPER_ID" --timestamp --options=runtime --entitlements "$XKEY_ENTITLEMENTS_EXPANDED" "Release/XKey.app"
             else
-                codesign --force --sign - --identifier "$BUNDLE_ID" --entitlements "XKey/XKeyRelease.entitlements" "Release/XKey.app"
+                codesign --force --sign - --identifier "$BUNDLE_ID" --entitlements "$XKEY_ENTITLEMENTS_EXPANDED" "Release/XKey.app"
             fi
 
             # Verify XKey.app signature after re-signing

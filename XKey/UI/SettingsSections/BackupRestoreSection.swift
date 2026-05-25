@@ -20,6 +20,10 @@ struct BackupRestoreSection: View {
     @State private var syncStatus = iCloudSyncManager.shared.status
     @State private var lastSyncDate = iCloudSyncManager.shared.lastSyncDate
     @State private var syncStatusObserver: NSObjectProtocol?
+    @State private var firstEnablePromptObserver: NSObjectProtocol?
+    @State private var showFirstEnablePrompt = false
+    @State private var firstEnableCategories: [SyncCategory] = []
+    @State private var isKVSAvailable = iCloudSyncManager.isKVSAvailable
 
     var body: some View {
         ScrollView {
@@ -27,6 +31,18 @@ struct BackupRestoreSection: View {
                 // iCloud Sync Section
                 SettingsGroup(title: "iCloud Sync") {
                     VStack(alignment: .leading, spacing: 10) {
+                        if !isKVSAvailable {
+                            HStack(spacing: 6) {
+                                Image(systemName: "icloud.slash")
+                                    .foregroundColor(.secondary)
+                                Text("iCloud Sync không khả dụng")
+                                    .fontWeight(.medium)
+                            }
+                            Text("Vui lòng đăng nhập iCloud và bật iCloud Drive trên máy này. Trên macOS 26+, một số phiên bản phân phối ngoài App Store có thể tạm thời không hỗ trợ iCloud Sync.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } else {
                         Toggle(isOn: $iCloudSyncEnabled) {
                             HStack(spacing: 6) {
                                 Image(systemName: "icloud")
@@ -47,7 +63,7 @@ struct BackupRestoreSection: View {
                                 iCloudSyncStatusText(syncStatus, lastSyncDate: lastSyncDate)
                                 Spacer()
                                 Button(action: {
-                                    iCloudSyncManager.shared.pushToCloud()
+                                    iCloudSyncManager.shared.pushAll()
                                     syncStatus = iCloudSyncManager.shared.status
                                     lastSyncDate = iCloudSyncManager.shared.lastSyncDate
                                 }) {
@@ -78,10 +94,12 @@ struct BackupRestoreSection: View {
                                 }
                             }
 
+                            iCloudSyncQuotaMeter()
+
                             HStack {
                                 if let size = iCloudSyncManager.shared.syncDataSizeBytes {
                                     let sizeStr = ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
-                                    Text(String(localized: "Dung lượng: \(sizeStr) / 1 MB"))
+                                    Text(String(localized: "Tổng dung lượng: \(sizeStr) / \(SyncCategory.allCases.count) MB"))
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                 }
@@ -101,9 +119,12 @@ struct BackupRestoreSection: View {
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
+                        }  // end if isKVSAvailable
                     }
                 }
                 .onAppear {
+                    // Re-probe KVS in case user signed into iCloud after launch.
+                    isKVSAvailable = iCloudSyncManager.isKVSAvailable
                     syncStatusObserver = NotificationCenter.default.addObserver(
                         forName: .iCloudSyncStatusDidChange,
                         object: nil,
@@ -111,12 +132,46 @@ struct BackupRestoreSection: View {
                     ) { _ in
                         syncStatus = iCloudSyncManager.shared.status
                         lastSyncDate = iCloudSyncManager.shared.lastSyncDate
+                        iCloudSyncEnabled = iCloudSyncManager.shared.isEnabled
+                    }
+                    firstEnablePromptObserver = NotificationCenter.default.addObserver(
+                        forName: .iCloudSyncFirstEnablePrompt,
+                        object: nil,
+                        queue: .main
+                    ) { _ in
+                        firstEnableCategories = iCloudSyncManager.shared.categoriesWithRemoteData()
+                        showFirstEnablePrompt = true
                     }
                 }
                 .onDisappear {
                     if let observer = syncStatusObserver {
                         NotificationCenter.default.removeObserver(observer)
                     }
+                    if let observer = firstEnablePromptObserver {
+                        NotificationCenter.default.removeObserver(observer)
+                    }
+                }
+                .confirmationDialog(
+                    Text("iCloud đã có dữ liệu thiết lập sẵn"),
+                    isPresented: $showFirstEnablePrompt,
+                    titleVisibility: .visible
+                ) {
+                    Button("Gộp local + iCloud") {
+                        iCloudSyncManager.shared.applyFirstEnableChoice(.merge)
+                    }
+                    Button("Dùng dữ liệu trên iCloud (ghi đè local)") {
+                        iCloudSyncManager.shared.applyFirstEnableChoice(.useRemote)
+                    }
+                    Button("Đẩy local lên iCloud (ghi đè cloud)", role: .destructive) {
+                        iCloudSyncManager.shared.applyFirstEnableChoice(.useLocal)
+                    }
+                    Button("Hủy", role: .cancel) {
+                        iCloudSyncManager.shared.applyFirstEnableChoice(.cancel)
+                        iCloudSyncEnabled = false
+                    }
+                } message: {
+                    let names = firstEnableCategories.map { iCloudSyncCategoryName($0) }
+                    Text(String(localized: "Dữ liệu hiện có trên iCloud: \(names.joined(separator: ", ")). Hãy chọn cách xử lý."))
                 }
 
                 // Export Section
@@ -471,6 +526,56 @@ private func iCloudSyncItem(icon: String, text: String) -> some View {
         Text(text)
             .font(.caption2)
             .foregroundColor(.secondary)
+    }
+}
+
+/// Localized display name for a sync category — used in the first-enable prompt.
+func iCloudSyncCategoryName(_ category: SyncCategory) -> String {
+    switch category {
+    case .scalars:      return String(localized: "Thiết lập")
+    case .macros:       return String(localized: "Macro")
+    case .rules:        return String(localized: "Quy tắc")
+    case .excludedApps: return String(localized: "Ứng dụng loại trừ")
+    case .userDict:     return String(localized: "Từ điển")
+    }
+}
+
+/// Per-category byte usage row so the user can see which category is approaching the 1 MB cap.
+private struct iCloudSyncQuotaMeter: View {
+    @State private var refreshTick = 0
+    @State private var statusObserver: NSObjectProtocol?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            ForEach(SyncCategory.allCases, id: \.rawValue) { category in
+                let bytes = iCloudSyncManager.shared.bytes(for: category) ?? 0
+                let pct = min(Double(bytes) / 1_000_000.0, 1.0)
+                HStack(spacing: 6) {
+                    Text(iCloudSyncCategoryName(category))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .frame(width: 110, alignment: .leading)
+                    ProgressView(value: pct)
+                        .progressViewStyle(.linear)
+                        .tint(pct >= 0.95 ? .red : (pct >= 0.8 ? .orange : .accentColor))
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file))
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .frame(width: 64, alignment: .trailing)
+                }
+            }
+        }
+        .id(refreshTick)
+        .onAppear {
+            statusObserver = NotificationCenter.default.addObserver(
+                forName: .iCloudSyncStatusDidChange,
+                object: nil,
+                queue: .main
+            ) { _ in refreshTick &+= 1 }
+        }
+        .onDisappear {
+            if let obs = statusObserver { NotificationCenter.default.removeObserver(obs) }
+        }
     }
 }
 

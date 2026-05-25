@@ -104,14 +104,17 @@ class MacroManagementViewModel: ObservableObject {
         let macro = MacroItem(text: text, content: content)
         macros.append(macro)
         macros.sort { $0.text < $1.text }
-        
+
         // Save to plist first
         saveMacros()
-        
+
+        // Adding a macro with a previously-tombstoned id (re-import case) clears the tombstone.
+        SyncTombstoneStore.shared.remove(category: .macros, id: macro.id.uuidString)
+
         // Always post notification to ensure engine reloads macros
         log("   📢 Posting macrosDidChange notification...")
         NotificationCenter.default.post(name: .macrosDidChange, object: nil)
-        
+
         return true
     }
     
@@ -145,10 +148,14 @@ class MacroManagementViewModel: ObservableObject {
     func deleteMacro(_ macro: MacroItem) {
         log("deleteMacro called: '\(macro.text)'")
         macros.removeAll { $0.id == macro.id }
-        
+
         // Save to plist first
         saveMacros()
-        
+
+        // Record tombstone so the deletion propagates via iCloud sync instead of being
+        // overwritten by a peer that still has the entry.
+        SyncTombstoneStore.shared.record(category: .macros, id: macro.id.uuidString)
+
         // Always post notification to ensure engine reloads macros
         log("   📢 Posting macrosDidChange notification...")
         NotificationCenter.default.post(name: .macrosDidChange, object: nil)
@@ -186,11 +193,17 @@ class MacroManagementViewModel: ObservableObject {
     
     func clearAll() {
         log("clearAll called")
+        let deletedIDs = macros.map { $0.id.uuidString }
         macros.removeAll()
-        
+
         // Save to plist first
         saveMacros()
-        
+
+        // Tombstone every cleared macro so the deletion propagates to peers.
+        for id in deletedIDs {
+            SyncTombstoneStore.shared.record(category: .macros, id: id)
+        }
+
         // Always post notification to ensure engine reloads macros
         log("   📢 Posting macrosDidChange notification...")
         NotificationCenter.default.post(name: .macrosDidChange, object: nil)

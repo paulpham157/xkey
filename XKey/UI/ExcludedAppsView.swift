@@ -108,10 +108,12 @@ struct ExcludedAppsSettingsSection: View {
             return
         }
         viewModel.preferences.excludedApps.append(app)
+        SyncTombstoneStore.shared.remove(category: .excludedApps, id: app.bundleIdentifier)
     }
-    
+
     private func removeApp(_ app: ExcludedApp) {
         viewModel.preferences.excludedApps.removeAll { $0.bundleIdentifier == app.bundleIdentifier }
+        SyncTombstoneStore.shared.record(category: .excludedApps, id: app.bundleIdentifier)
     }
 }
 

@@ -27,7 +27,6 @@
 		100D2BE22EF2C59700C26B87 /* VowelSequenceValidator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000005 /* VowelSequenceValidator.swift */; };
 		100D2BE42EF2C71E00C26B87 /* IMKitHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100D2BE32EF2C71E00C26B87 /* IMKitHelper.swift */; };
 		100D2BE62EF2C72600C26B87 /* SharedSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100D2BE52EF2C72600C26B87 /* SharedSettings.swift */; };
-		ICLOUDSYNC001 /* iCloudSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = ICLOUDSYNC002 /* iCloudSyncManager.swift */; };
 		10133E5C2EF04B0C00BBE6AE /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 10133E5B2EF04B0C00BBE6AE /* Assets.xcassets */; };
 		101A44482ED419AE003F9D05 /* Preferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = 101A44472ED419AE003F9D05 /* Preferences.swift */; };
 		1025CD6E2F27CA13007B6E9F /* VNEngineBackspaceRestoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1025CD6D2F27CA13007B6E9F /* VNEngineBackspaceRestoreTests.swift */; };
@@ -111,7 +110,6 @@
 		DEBUGVIEW001 /* DebugView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEBUGVIEW002 /* DebugView.swift */; };
 		DEBUGVM001 /* DebugViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEBUGVM002 /* DebugViewModel.swift */; };
 		E2BB81375FD0B38574D4F669 /* SharedSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 100D2BE52EF2C72600C26B87 /* SharedSettings.swift */; };
-		ICLOUDSYNC003 /* iCloudSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = ICLOUDSYNC002 /* iCloudSyncManager.swift */; };
 		E52C23534F4E3183B55BE6D0 /* ExcludedAppsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2FB7B1CC880090240CFD79B3 /* ExcludedAppsSection.swift */; };
 		E575FD959786D9DC3A1E6856 /* ConvertToolSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3A3D9B46E4A73E69A837ADAD /* ConvertToolSection.swift */; };
 		E93062521966136C34EDEC22 /* VNEngineSmartSwitch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5AAC14FFBBB2B10B6A983B1A /* VNEngineSmartSwitch.swift */; };
@@ -123,8 +121,12 @@
 		F97414DB17E4F78264530EF1 /* KeyCodeToCharacter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EE4B88BB1709FA867C406CE /* KeyCodeToCharacter.swift */; };
 		FC31E5BF03BAE76EB0EF5881 /* CustomConsonantChipEditor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12D7FA2CC6EE444A4EB7B965 /* CustomConsonantChipEditor.swift */; };
 		FFFF798B22C18C084A0F7458 /* MacroSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49F58879C0DDD2958AA9FF0D /* MacroSection.swift */; };
-		L10N00001 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = L10N00002 /* Localizable.xcstrings */; };
+		ICLOUDSYNC001 /* iCloudSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = ICLOUDSYNC002 /* iCloudSyncManager.swift */; };
+		ICLOUDSYNC003 /* iCloudSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = ICLOUDSYNC002 /* iCloudSyncManager.swift */; };
 		ICLOUDSYNCTEST001 /* iCloudSyncManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = ICLOUDSYNCTEST002 /* iCloudSyncManagerTests.swift */; };
+		ICLOUDTYPES001 /* iCloudSyncTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = ICLOUDTYPES002 /* iCloudSyncTypes.swift */; };
+		ICLOUDTYPES003 /* iCloudSyncTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = ICLOUDTYPES002 /* iCloudSyncTypes.swift */; };
+		L10N00001 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = L10N00002 /* Localizable.xcstrings */; };
 		LANG0001 /* AppLanguageTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = LANG0002 /* AppLanguageTests.swift */; };
 		LAUNCHATLOGIN001 /* LaunchAtLogin.swift in Sources */ = {isa = PBXBuildFile; fileRef = LAUNCHATLOGIN002 /* LaunchAtLogin.swift */; };
 		MACR0001 /* MacroManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = MACR0002 /* MacroManagerTests.swift */; };
@@ -137,6 +139,8 @@
 		TEST00023 /* TranslationProviderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TEST00024 /* TranslationProviderTests.swift */; };
 		TEST00025 /* AXDirectFallbackTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TEST00026 /* AXDirectFallbackTests.swift */; };
 		TEST00027 /* VNEngineAutoCapitalizeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TEST00028 /* VNEngineAutoCapitalizeTests.swift */; };
+		TOMBSTONE001 /* SyncTombstoneStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = TOMBSTONE002 /* SyncTombstoneStore.swift */; };
+		TOMBSTONE003 /* SyncTombstoneStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = TOMBSTONE002 /* SyncTombstoneStore.swift */; };
 		TRANSLATTB001 /* TranslationToolbarController.swift in Sources */ = {isa = PBXBuildFile; fileRef = TRANSLATTB002 /* TranslationToolbarController.swift */; };
 		TRANSLATTB003 /* TranslationToolbarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = TRANSLATTB004 /* TranslationToolbarView.swift */; };
 		TRANSLATTB005 /* TranslationToolbarViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = TRANSLATTB006 /* TranslationToolbarViewModel.swift */; };
@@ -161,7 +165,6 @@
 		100D2BDE2EF2C21800C26B87 /* XKeyRelease.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = XKeyRelease.entitlements; sourceTree = "<group>"; };
 		100D2BE32EF2C71E00C26B87 /* IMKitHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IMKitHelper.swift; sourceTree = "<group>"; };
 		100D2BE52EF2C72600C26B87 /* SharedSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedSettings.swift; sourceTree = "<group>"; };
-		ICLOUDSYNC002 /* iCloudSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iCloudSyncManager.swift; sourceTree = "<group>"; };
 		10133E5B2EF04B0C00BBE6AE /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		101A44472ED419AE003F9D05 /* Preferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Preferences.swift; sourceTree = "<group>"; };
 		1025CD6D2F27CA13007B6E9F /* VNEngineBackspaceRestoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VNEngineBackspaceRestoreTests.swift; sourceTree = "<group>"; };
@@ -251,8 +254,10 @@
 		EF69262CDE29C3D3410A3567 /* VNEngineMacro.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = VNEngineMacro.swift; sourceTree = "<group>"; };
 		EXCLUDEDAPPS002 /* ExcludedAppsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExcludedAppsView.swift; sourceTree = "<group>"; };
 		F362794B762A19FE8D883F35 /* AdvancedSection.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = AdvancedSection.swift; sourceTree = "<group>"; };
-		L10N00002 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
+		ICLOUDSYNC002 /* iCloudSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iCloudSyncManager.swift; sourceTree = "<group>"; };
 		ICLOUDSYNCTEST002 /* iCloudSyncManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iCloudSyncManagerTests.swift; sourceTree = "<group>"; };
+		ICLOUDTYPES002 /* iCloudSyncTypes.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = iCloudSyncTypes.swift; sourceTree = "<group>"; };
+		L10N00002 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		LANG0002 /* AppLanguageTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLanguageTests.swift; sourceTree = "<group>"; };
 		LAUNCHATLOGIN002 /* LaunchAtLogin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchAtLogin.swift; sourceTree = "<group>"; };
 		MACR0002 /* MacroManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacroManagerTests.swift; sourceTree = "<group>"; };
@@ -266,6 +271,7 @@
 		TEST00024 /* TranslationProviderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TranslationProviderTests.swift; sourceTree = "<group>"; };
 		TEST00026 /* AXDirectFallbackTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AXDirectFallbackTests.swift; sourceTree = "<group>"; };
 		TEST00028 /* VNEngineAutoCapitalizeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VNEngineAutoCapitalizeTests.swift; sourceTree = "<group>"; };
+		TOMBSTONE002 /* SyncTombstoneStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SyncTombstoneStore.swift; sourceTree = "<group>"; };
 		TRANSLATTB002 /* TranslationToolbarController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TranslationToolbarController.swift; sourceTree = "<group>"; };
 		TRANSLATTB004 /* TranslationToolbarView.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TranslationToolbarView.swift; sourceTree = "<group>"; };
 		TRANSLATTB006 /* TranslationToolbarViewModel.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TranslationToolbarViewModel.swift; sourceTree = "<group>"; };
@@ -342,6 +348,8 @@
 				10FDCC1B2EF5942400B2D9AC /* InputSourceSwitcher.swift */,
 				100D2BE52EF2C72600C26B87 /* SharedSettings.swift */,
 				ICLOUDSYNC002 /* iCloudSyncManager.swift */,
+				ICLOUDTYPES002 /* iCloudSyncTypes.swift */,
+				TOMBSTONE002 /* SyncTombstoneStore.swift */,
 				100D2BE32EF2C71E00C26B87 /* IMKitHelper.swift */,
 				LAUNCHATLOGIN002 /* LaunchAtLogin.swift */,
 				APPVERSION002 /* AppVersion.swift */,
@@ -725,6 +733,8 @@
 				100D2BDD2EF2C1D800C26B87 /* VNEngineSettings.swift in Sources */,
 				E2BB81375FD0B38574D4F669 /* SharedSettings.swift in Sources */,
 				ICLOUDSYNC003 /* iCloudSyncManager.swift in Sources */,
+				ICLOUDTYPES003 /* iCloudSyncTypes.swift in Sources */,
+				TOMBSTONE003 /* SyncTombstoneStore.swift in Sources */,
 				259D34BEC13552450AB30413 /* DebugLogger.swift in Sources */,
 				F97414DB17E4F78264530EF1 /* KeyCodeToCharacter.swift in Sources */,
 				TYPBUF003 /* TypingBuffer.swift in Sources */,
@@ -789,6 +799,8 @@
 				EXCLUDEDAPPS001 /* ExcludedAppsView.swift in Sources */,
 				100D2BE62EF2C72600C26B87 /* SharedSettings.swift in Sources */,
 				ICLOUDSYNC001 /* iCloudSyncManager.swift in Sources */,
+				ICLOUDTYPES001 /* iCloudSyncTypes.swift in Sources */,
+				TOMBSTONE001 /* SyncTombstoneStore.swift in Sources */,
 				F97414DA17E4F78264530EF0 /* KeyCodeToCharacter.swift in Sources */,
 				795D22D182670DD83BDECF21 /* XKey/UI/WindowTitleRulesView.swift in Sources */,
 				10BEC2BC2F2675B200D6A3C3 /* TranslationNetworkManager.swift in Sources */,
