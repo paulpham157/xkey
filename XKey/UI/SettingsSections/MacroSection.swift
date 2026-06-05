@@ -35,6 +35,7 @@ struct MacroSection: View {
     @State private var editingMacro: MacroItem? = nil
     @State private var searchText: String = ""
     @State private var showClearAllConfirm: Bool = false
+    @State private var showTRGuide: Bool = false
     @FocusState private var isContentFieldFocused: Bool
 
     private var filteredMacros: [MacroItem] {
@@ -180,18 +181,37 @@ struct MacroSection: View {
                             .padding(8)
                             .background(Color(NSColor.controlBackgroundColor))
                             .cornerRadius(8)
+                            .frame(maxWidth: .infinity)
 
-                            Spacer()
-
-                            Button(action: viewModel.importMacros) {
-                                Label("Import", systemImage: "square.and.arrow.down")
+                            Menu {
+                                Section("File macro (XKey)") {
+                                    Button {
+                                        viewModel.importMacros()
+                                    } label: {
+                                        Label("Nhập từ file…", systemImage: "square.and.arrow.down")
+                                    }
+                                    Button {
+                                        viewModel.exportMacros()
+                                    } label: {
+                                        Label("Xuất ra file…", systemImage: "square.and.arrow.up")
+                                    }
+                                }
+                                Section("macOS Text Replacements") {
+                                    Button {
+                                        viewModel.importFromTextReplacements()
+                                    } label: {
+                                        Label("Nhập từ Text Replacements", systemImage: "arrow.down.doc")
+                                    }
+                                    Button {
+                                        showTRGuide = true
+                                    } label: {
+                                        Label("Đồng bộ sang Text Replacements…", systemImage: "arrow.up.doc")
+                                    }
+                                }
+                            } label: {
+                                Label("Nhập / Xuất", systemImage: "square.and.arrow.up.on.square")
                             }
-                            .buttonStyle(.bordered)
-
-                            Button(action: viewModel.exportMacros) {
-                                Label("Export", systemImage: "square.and.arrow.up")
-                            }
-                            .buttonStyle(.bordered)
+                            .fixedSize()
                         }
 
                         Divider()
@@ -318,6 +338,9 @@ struct MacroSection: View {
                     set: { if !$0 { editingMacro = nil } }
                 )
             )
+        }
+        .sheet(isPresented: $showTRGuide) {
+            TextReplacementsGuideSheet(viewModel: viewModel, isPresented: $showTRGuide)
         }
         .onAppear {
             viewModel.loadMacros()
@@ -679,6 +702,111 @@ struct EditMacroSheet: View {
             return false
         }
         return String(String.UnicodeScalarView(filtered))
+    }
+}
+
+
+// MARK: - Text Replacements Sync Guide
+
+/// Actionable guide that walks the user through exporting macros into the
+/// macOS Text Replacements feature: export the file (revealed in Finder),
+/// open the Keyboard settings, then drag the file into the Text Replacements list.
+struct TextReplacementsGuideSheet: View {
+    @ObservedObject var viewModel: MacroManagementViewModel
+    @Binding var isPresented: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            // Header
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Đồng bộ macro sang Text Replacements")
+                        .font(.title3)
+                        .fontWeight(.semibold)
+                    Text("Để dùng macro trên iPhone/iPad qua iCloud của Apple.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                Button { isPresented = false } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Divider()
+
+            stepRow(number: "1", title: "Xuất file macro") {
+                Button {
+                    viewModel.exportToTextReplacementsPlist()
+                } label: {
+                    Label("Export file .plist", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+
+            stepRow(number: "2", title: "Mở cài đặt Text Replacements") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Button {
+                        viewModel.openTextReplacementsSettings()
+                    } label: {
+                        Label("Mở Text Replacements", systemImage: "keyboard")
+                    }
+                    .buttonStyle(.bordered)
+                    Text("Trong pane Keyboard, bấm nút “Text Replacements…”.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            stepRow(number: "3", title: "Kéo file thả vào danh sách") {
+                Text("Sau khi Export, file .plist hiện sẵn trong Finder. Kéo file đó thả vào danh sách trong cửa sổ Text Replacements.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Warning
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundColor(.orange)
+                Text("Trùng từ viết tắt sẽ tạo bản đôi. Đừng đẩy hàng nghìn macro một lần — macOS dễ lỗi ở số lượng lớn.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(10)
+            .background(Color.orange.opacity(0.1))
+            .cornerRadius(8)
+
+            HStack {
+                Spacer()
+                Button("Đóng") { isPresented = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 460)
+    }
+
+    @ViewBuilder
+    private func stepRow<Content: View>(number: String, title: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(number)
+                .font(.system(.body, design: .rounded))
+                .fontWeight(.bold)
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(Color.accentColor.opacity(0.15)))
+                .foregroundColor(.accentColor)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .fontWeight(.medium)
+                content()
+            }
+            Spacer(minLength: 0)
+        }
     }
 }
 

@@ -7,6 +7,7 @@
 
 import Foundation
 import AppKit
+import UniformTypeIdentifiers
 
 // Notification names
 extension Notification.Name {
@@ -300,6 +301,105 @@ class MacroManagementViewModel: ObservableObject {
             showAlert(title: String(localized: "Lỗi"), message: String(localized: "Không thể lưu file: \(error.localizedDescription)"))
         }
     }
+
+    // MARK: - macOS Text Replacements Interop
+
+    /// Enabled macros only — macOS Text Replacements has no per-entry disabled state.
+    var enabledMacros: [MacroItem] {
+        macros.filter { $0.isEnabled }
+    }
+
+    /// Import shortcuts from the macOS system Text Replacements list.
+    /// Read-only via the public `NSSpellChecker.userReplacementsDictionary` API
+    /// (there is no public API to write back, so this is intentionally one-way).
+    func importFromTextReplacements() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.importFromTextReplacements() }
+            return
+        }
+
+        let replacements = NSSpellChecker.shared.userReplacementsDictionary
+        guard !replacements.isEmpty else {
+            showAlert(title: String(localized: "Thông báo"),
+                      message: String(localized: "macOS Text Replacements đang trống"))
+            return
+        }
+
+        // Keys are the typed shortcuts, values are the expansion phrases.
+        var added = 0
+        for (shortcut, phrase) in replacements {
+            let text = shortcut.trimmingCharacters(in: .whitespaces)
+            guard !text.isEmpty, !phrase.isEmpty,
+                  !macros.contains(where: { $0.text == text }) else { continue }
+            macros.append(MacroItem(text: text, content: phrase))
+            added += 1
+        }
+
+        if added > 0 {
+            macros.sort { $0.text < $1.text }
+            saveMacros()
+            NotificationCenter.default.post(name: .macrosDidChange, object: nil)
+            showAlert(title: String(localized: "Thành công"),
+                      message: String(localized: "Đã nhập \(added) macro từ Text Replacements"))
+        } else {
+            showAlert(title: String(localized: "Thông báo"),
+                      message: String(localized: "Không có mục mới để nhập"))
+        }
+    }
+
+    /// Export enabled macros to a `.plist` file the user can drag into
+    /// System Settings > Keyboard > Text Replacements. XKey never writes the
+    /// system store directly — the user performs the supported drag-drop import.
+    func exportToTextReplacementsPlist() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in self?.exportToTextReplacementsPlist() }
+            return
+        }
+
+        let items = enabledMacros
+        guard !items.isEmpty else {
+            showAlert(title: String(localized: "Thông báo"),
+                      message: String(localized: "Không có macro nào đang bật để export"))
+            return
+        }
+        guard let data = TextReplacementsExporter.plistData(for: items) else {
+            showAlert(title: String(localized: "Lỗi"),
+                      message: String(localized: "Không thể tạo file .plist"))
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+
+        let panel = NSSavePanel()
+        panel.title = "Export Text Replacements"
+        panel.message = String(localized: "Lưu file .plist rồi kéo vào System Settings > Keyboard > Text Replacements")
+        panel.nameFieldStringValue = "XKey Text Replacements.plist"
+        panel.allowedContentTypes = [.propertyList]
+        panel.canCreateDirectories = true
+        panel.level = .modalPanel
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        do {
+            try data.write(to: url)
+            showAlert(title: String(localized: "Thành công"),
+                      message: String(localized: "Đã export \(items.count) macro. File đang hiện trong Finder — kéo nó vào danh sách Text Replacements."))
+            // Reveal AFTER the alert so Finder ends up frontmost, ready for the drag step
+            // (NSAlert.runModal reactivates this app, so revealing earlier would be undone).
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } catch {
+            showAlert(title: String(localized: "Lỗi"),
+                      message: String(localized: "Không thể lưu file: \(error.localizedDescription)"))
+        }
+    }
+
+    /// Open System Settings at the Keyboard pane. This is the deepest public
+    /// deep-link available; the user then taps "Text Replacements…" to open the sheet.
+    func openTextReplacementsSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.Keyboard-Settings.extension") {
+            NSWorkspace.shared.open(url)
+        }
+    }
     
     // MARK: - Helpers
     
@@ -310,5 +410,19 @@ class MacroManagementViewModel: ObservableObject {
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
         alert.runModal()
+    }
+}
+
+
+/// Encodes macros into the macOS Text Replacements drag-drop `.plist` format:
+/// a root array of `{ "phrase": ..., "shortcut": ... }` dictionaries — the exact
+/// schema macOS produces when dragging entries out of System Settings (verified
+/// on macOS 26.5.1). XKey only generates this file; the user performs the import.
+enum TextReplacementsExporter {
+    static func plistData(for macros: [MacroItem]) -> Data? {
+        let items: [[String: String]] = macros.map {
+            ["shortcut": $0.text, "phrase": $0.content]
+        }
+        return try? PropertyListSerialization.data(fromPropertyList: items, format: .xml, options: 0)
     }
 }
