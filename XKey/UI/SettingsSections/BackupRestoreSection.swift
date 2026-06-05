@@ -45,8 +45,10 @@ struct BackupRestoreSection: View {
                         } else {
                         Toggle(isOn: $iCloudSyncEnabled) {
                             HStack(spacing: 6) {
-                                Image(systemName: "icloud")
                                 Text("Đồng bộ thiết lập qua iCloud")
+                                Spacer()
+                                Image(systemName: "icloud")
+                                    .foregroundColor(.secondary)
                             }
                         }
                         .onChange(of: iCloudSyncEnabled) { newValue in
@@ -69,6 +71,7 @@ struct BackupRestoreSection: View {
                                 }) {
                                     HStack(spacing: 4) {
                                         Image(systemName: "arrow.triangle.2.circlepath")
+                                            .imageScale(.small)
                                         Text("Đồng bộ ngay")
                                     }
                                 }
@@ -107,6 +110,7 @@ struct BackupRestoreSection: View {
                                 Button(action: exportFromiCloud) {
                                     HStack(spacing: 4) {
                                         Image(systemName: "square.and.arrow.up.on.square")
+                                            .imageScale(.small)
                                         Text("Export từ iCloud")
                                     }
                                 }

@@ -67,9 +67,15 @@ final class iCloudSyncManager: NSObject {
 
     // MARK: - Availability
 
-    /// True when ubiquity-kvstore-identifier entitlement present and KVS reachable.
-    /// Developer ID release builds on macOS 26+ omit the entitlement (runtime SIGKILL otherwise).
-    /// synchronize() returns false when entitlement absent — safe to call always.
+    /// True when the ubiquity-kvstore-identifier entitlement is present and KVS is reachable.
+    /// synchronize() returns false when the entitlement is absent — safe to call always.
+    ///
+    /// NOTE: A notarized Developer ID (non-App-Store) build CAN use iCloud KVS. The earlier
+    /// "SIGKILL on launch" was NOT a platform ban — it was a code-signing mismatch: the binary
+    /// was signed with a Developer ID cert that was not listed in the embedded provisioning
+    /// profile's DeveloperCertificates, so amfid rejected the restricted entitlement with
+    /// -413 "No matching profile found". Signing with the cert the profile authorizes fixes it.
+    /// On macOS 26 KVS is CloudKit-backed under the hood (syncdefaultsd → cloudd → iCloud).
     static var isKVSAvailable: Bool {
         NSUbiquitousKeyValueStore.default.synchronize()
     }

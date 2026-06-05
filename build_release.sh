@@ -18,7 +18,7 @@ ENABLE_DMG=${ENABLE_DMG:-true}  # Set to false to skip DMG creation
 ENABLE_XKEYIM=${ENABLE_XKEYIM:-true}  # Set to false to skip XKeyIM build
 ENABLE_XKEYIM_BUNDLE=${ENABLE_XKEYIM_BUNDLE:-true}  # Set to false to skip bundling XKeyIM inside XKey.app
 ENABLE_PROFILE_EMBED=${ENABLE_PROFILE_EMBED:-true}  # Set to false to skip embedding Developer ID provisioning profile
-ENABLE_ICLOUD_ENTITLEMENT=${ENABLE_ICLOUD_ENTITLEMENT:-true}  # Diagnostic toggle. Trusts XKeyRelease.entitlements by default. Set false to strip ubiquity-kvstore-identifier from /tmp expanded entitlements before signing (useful only if someone re-adds the entitlement to the file for testing; macOS 26 SIGKILLs Developer ID binaries claiming any iCloud entitlement).
+ENABLE_ICLOUD_ENTITLEMENT=${ENABLE_ICLOUD_ENTITLEMENT:-true}  # Trusts XKeyRelease.entitlements by default (declares iCloud KVS: com.apple.developer.ubiquity-kvstore-identifier). iCloud sync IS valid on a notarized Developer ID build, provided the signing cert is the one listed in the embedded Developer ID profile's DeveloperCertificates (otherwise amfid rejects with -413 "No matching profile found" → SIGKILL). Set false only to strip the KVS entitlement from the /tmp expanded copy for a sync-disabled control build.
 
 # Smart defaults: If notarizing, assume it's a full release
 if [ "$ENABLE_NOTARIZE" = true ]; then
@@ -73,25 +73,82 @@ echo ""
 # Create Release directory
 mkdir -p Release
 
+# Provisioning profile resolution + signing-identity derivation helpers.
+PROFILE_DIR="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+DEVID_PROFILE_NAME="XKey Developer ID Distribution"
+
+# Newest installed provisioning profile whose Name matches DEVID_PROFILE_NAME.
+# Xcode's "Download Manual Profiles" saves UUID-named files and an older pretty-named
+# file may be stale, so newest-by-mtime wins.
+resolve_devid_profile() {
+    ls -t "$PROFILE_DIR"/*.provisionprofile 2>/dev/null | while IFS= read -r f; do
+        name=$(security cms -D -i "$f" 2>/dev/null | grep -A1 "<key>Name</key>" | tail -1 | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
+        [ "$name" = "$DEVID_PROFILE_NAME" ] && echo "$f" && break
+    done
+}
+
+# SHA-1 of the signing identity to use: the certificate that is BOTH embedded in the
+# given profile's DeveloperCertificates AND available in the keychain as a codesigning
+# identity (i.e. has a private key). This guarantees the signing cert matches the embedded
+# profile, which is exactly what amfid requires for restricted com.apple.developer.*
+# entitlements (a mismatch causes -413 "No matching profile found" → SIGKILL at launch).
+# Echoes nothing when it cannot determine one — the caller then falls back.
+signing_sha_from_profile() {
+    local profile="$1"
+    [ -f "$profile" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    local profile_shas id_shas psha
+    profile_shas=$(security cms -D -i "$profile" 2>/dev/null | python3 -c '
+import sys, plistlib, hashlib
+try:
+    d = plistlib.loads(sys.stdin.buffer.read())
+    for c in d.get("DeveloperCertificates", []):
+        print(hashlib.sha1(bytes(c)).hexdigest().upper())
+except Exception:
+    pass') || return 0
+    id_shas=$(security find-identity -v -p codesigning | grep -oE "[0-9A-F]{40}")
+    for psha in $profile_shas; do
+        echo "$id_shas" | grep -q "$psha" && { echo "$psha"; return 0; }
+    done
+}
+
 # Detect Developer ID if code signing is enabled
 if [ "$ENABLE_CODESIGN" = true ]; then
     echo "🔍 Detecting Developer ID certificate..."
     
-    # Find Developer ID Application certificate
-    DEVELOPER_ID=$(security find-identity -v -p codesigning | grep "Developer ID Application" | head -1 | sed -E 's/.*"(.*)"/\1/')
-    
-    if [ -z "$DEVELOPER_ID" ]; then
-        echo "⚠️  No Developer ID Application certificate found in keychain"
-        echo "   Available certificates:"
+    # Choose the signing identity by SHA-1, NOT by name: there can be multiple
+    # "Developer ID Application: Luong Van Duc (7E6Z9B4F2H)" certs in the keychain and
+    # signing by name then fails as "ambiguous". The cert MUST also be the one embedded in
+    # the Developer ID provisioning profile's DeveloperCertificates list, otherwise amfid
+    # rejects the restricted iCloud KVS entitlement at launch with
+    #   Error -413 "No matching profile found"  →  SIGKILL (Code Signature Invalid).
+    #
+    # Resolution priority (self-healing — survives cert renewal / profile regeneration):
+    #   1. CODESIGN_IDENTITY_SHA env override (manual escape hatch)
+    #   2. cert derived from the embedded profile ∩ keychain identities (guarantees match)
+    #   3. hardcoded fallback (last known-good cert, valid until Dec 2030)
+    XKEY_DEVID_PROFILE="$(resolve_devid_profile)"
+    DERIVED_SHA="$(signing_sha_from_profile "$XKEY_DEVID_PROFILE")"
+    CODESIGN_IDENTITY_SHA=${CODESIGN_IDENTITY_SHA:-${DERIVED_SHA:-76E8032F7A72F9CD503461F7D395B829149742B5}}
+    [ -n "$DERIVED_SHA" ] && echo "🔎 Signing cert derived from embedded profile" || echo "🔎 Using fallback/override signing cert (profile derivation unavailable)"
+
+    IDENTITY_LINE=$(security find-identity -v -p codesigning | grep -i "$CODESIGN_IDENTITY_SHA" | head -1)
+    if [ -z "$IDENTITY_LINE" ]; then
+        echo "⚠️  Pinned signing identity $CODESIGN_IDENTITY_SHA not found in keychain"
+        echo "   Available codesigning identities:"
         security find-identity -v -p codesigning
         echo ""
         echo "   Building without code signing..."
         ENABLE_CODESIGN=false
     else
-        echo "✅ Found: $DEVELOPER_ID"
-        
-        # Extract Team ID from certificate
-        TEAM_ID=$(echo "$DEVELOPER_ID" | sed -E 's/.*\(([A-Z0-9]+)\).*/\1/')
+        # codesign --sign accepts the SHA-1 hash and resolves it unambiguously.
+        DEVELOPER_ID="$CODESIGN_IDENTITY_SHA"
+        DEVELOPER_ID_NAME=$(echo "$IDENTITY_LINE" | sed -E 's/.*"(.*)"/\1/')
+        echo "✅ Found: $DEVELOPER_ID_NAME"
+        echo "✅ Signing identity (SHA-1): $CODESIGN_IDENTITY_SHA"
+
+        # Extract Team ID from the certificate's friendly name
+        TEAM_ID=$(echo "$DEVELOPER_ID_NAME" | sed -E 's/.*\(([A-Z0-9]+)\).*/\1/')
         echo "✅ Team ID: $TEAM_ID"
     fi
 fi
@@ -105,6 +162,14 @@ echo "🔨 Building Universal Binary (Intel + Apple Silicon)..."
 
 if [ "$ENABLE_CODESIGN" = true ]; then
     echo "🔐 Code signing enabled with: $DEVELOPER_ID"
+    # Build with AD-HOC signing (no provisioning validation), then re-sign below with
+    # the Developer ID cert + embedded Developer ID profile (XKEY_DEVID_PROFILE).
+    # We CANNOT use automatic signing here: XKeyRelease.entitlements declares the
+    # restricted iCloud KVS entitlement (com.apple.developer.ubiquity-kvstore-identifier),
+    # and Xcode's auto-managed "Mac Team Provisioning Profile" is not authorized for it,
+    # so the automatic-signing pre-check fails. Ad-hoc signing applies the entitlements
+    # without any profile check; the real Developer ID signature + the authorized
+    # Developer ID profile are applied in the re-sign step further below.
     xcodebuild -project XKey.xcodeproj \
       -scheme XKey \
       -configuration Release \
@@ -112,11 +177,12 @@ if [ "$ENABLE_CODESIGN" = true ]; then
       -arch x86_64 -arch arm64 \
       ONLY_ACTIVE_ARCH=NO \
       PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
-      CODE_SIGN_STYLE=Automatic \
+      CODE_SIGN_STYLE=Manual \
+      CODE_SIGN_IDENTITY="-" \
+      PROVISIONING_PROFILE_SPECIFIER="" \
       DEVELOPMENT_TEAM="$TEAM_ID" \
-      CODE_SIGNING_REQUIRED=YES \
+      CODE_SIGNING_REQUIRED=NO \
       CODE_SIGNING_ALLOWED=YES \
-      OTHER_CODE_SIGN_FLAGS="--timestamp --options=runtime" \
       build
 else
     echo "⚠️  Code signing disabled"
@@ -151,32 +217,30 @@ sed "s/\$(TeamIdentifierPrefix)/${TEAM_ID}./g; s/\$(CFBundleIdentifier)/com.code
     "XKeyIM/XKeyIMRelease.entitlements" > "$XKEYIM_ENTITLEMENTS_EXPANDED" 2>/dev/null || \
     cp "XKeyIM/XKeyIMRelease.entitlements" "$XKEYIM_ENTITLEMENTS_EXPANDED" 2>/dev/null || true
 
-# Optionally strip ubiquity-kvstore-identifier from XKey entitlements (diagnostic mode)
+# Optionally strip the iCloud KVS entitlement from XKey entitlements (sync-disabled control build)
 if [ "$ENABLE_ICLOUD_ENTITLEMENT" = false ]; then
-    echo "⏭️  Stripping ubiquity-kvstore-identifier from release entitlements (diagnostic)"
-    # Remove both the <key> line and the following <string> line
-    sed -i.bak '/com\.apple\.developer\.ubiquity-kvstore-identifier/,+1d' "$XKEY_ENTITLEMENTS_EXPANDED"
-    rm -f "${XKEY_ENTITLEMENTS_EXPANDED}.bak"
+    echo "⏭️  Stripping iCloud KVS entitlement from release entitlements (sync-disabled build)"
+    # Primary key in use. The others are deleted defensively in case they were re-added.
+    /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.ubiquity-kvstore-identifier" "$XKEY_ENTITLEMENTS_EXPANDED" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.icloud-services" "$XKEY_ENTITLEMENTS_EXPANDED" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.icloud-container-identifiers" "$XKEY_ENTITLEMENTS_EXPANDED" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c "Delete :com.apple.developer.ubiquity-container-identifiers" "$XKEY_ENTITLEMENTS_EXPANDED" 2>/dev/null || true
 fi
 
-# Embed the Developer ID Distribution provisioning profile (defensive).
-# Currently no restricted entitlements remain in XKeyRelease.entitlements —
-# ubiquity-kvstore-identifier was removed because macOS 26 SIGKILLs Developer ID
-# binaries that claim any iCloud entitlement at task creation (taskgated/Code
-# Signing Monitor). Toggle ENABLE_ICLOUD_ENTITLEMENT=true to reproduce locally
-# (the entitlement is also stripped from /tmp expanded copy when toggle off).
-# Profile is still embedded so future restricted entitlements (push, deviceCheck)
-# would already have profile authorization. xcodebuild embeds a dev profile (Mac
-# Team) by default; we replace it with the Developer ID Distribution profile.
-XKEY_DEVID_PROFILE="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles/XKey_Developer_ID_Distribution.provisionprofile"
-# Fallback: search by name in case UUID-named file
-if [ ! -f "$XKEY_DEVID_PROFILE" ]; then
-    XKEY_DEVID_PROFILE=$(find "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles" \
-        -name "*.provisionprofile" -newer /dev/null 2>/dev/null | while read f; do
-        name=$(security cms -D -i "$f" 2>/dev/null | grep -A1 "<key>Name</key>" | tail -1 | sed 's/.*<string>\(.*\)<\/string>.*/\1/')
-        [ "$name" = "XKey Developer ID Distribution" ] && echo "$f" && break
-    done)
-fi
+# Embed the Developer ID Distribution provisioning profile (REQUIRED for iCloud KVS).
+# XKeyRelease.entitlements declares the restricted entitlement
+# com.apple.developer.ubiquity-kvstore-identifier. amfid validates restricted
+# com.apple.developer.* entitlements at runtime against the embedded provisioning profile.
+# The profile must satisfy BOTH conditions or the app is SIGKILLed at launch
+# ("Code Signature Invalid"):
+#   1. It authorizes the entitlement (this profile lists ubiquity-kvstore-identifier=TEAM.*).
+#   2. Its DeveloperCertificates list INCLUDES the exact Developer ID cert used to sign.
+# Condition (2) is the one that previously failed: the app was signed with a Developer ID
+# cert that was NOT in the profile, so amfid returned -413 "No matching profile found".
+# That is why the signing identity is pinned by SHA-1 above to the cert this profile carries.
+# This is the supported path for iCloud sync OUTSIDE the Mac App Store — NOT the old
+# (disproven) "macOS 26 bans iCloud on Developer ID" theory.
+# (XKEY_DEVID_PROFILE was already resolved during cert detection above.)
 if [ "$ENABLE_CODESIGN" = true ] && [ "$ENABLE_PROFILE_EMBED" = true ]; then
     if [ -n "$XKEY_DEVID_PROFILE" ] && [ -f "$XKEY_DEVID_PROFILE" ]; then
         echo "🔐 Embedding Developer ID Distribution provisioning profile..."
