@@ -64,6 +64,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var readWordHotKeyMonitor: Any?
     private var readWordGlobalHotKeyMonitor: Any?
     private var appSwitchObserver: NSObjectProtocol?
+    private var appDeactivateObserver: NSObjectProtocol?
     private var mouseClickMonitor: Any?
     private var permissionAlertShown = false
     private var permissionCheckTimer: Timer?
@@ -381,7 +382,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.keyboardHandler?.verboseEngineLogging = isVerbose
                 self?.debugWindowController?.logEvent(isVerbose ? "Verbose engine logging ENABLED (may cause lag)" : "Verbose engine logging DISABLED")
             }
-            
+
+            // Rewire per-keystroke log callbacks when logging is toggled
+            debugWindowController?.setupLoggingEnabledCallback { [weak self] _ in
+                self?.updateHotPathLogWiring()
+            }
+
             // Trigger callback immediately with current value to sync initial state
             // (didSet is not called during property initialization)
             if let controller = debugWindowController, controller.isVerboseLogging {
@@ -400,63 +406,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Create keyboard handler
         keyboardHandler = KeyboardEventHandler()
         debugWindowController?.logEvent("Keyboard handler created")
+
+        // Seed the frontmost-app cache; afterwards it is kept fresh by the
+        // didActivateApplicationNotification observer
+        keyboardHandler?.noteFrontmostApp(bundleId: NSWorkspace.shared.frontmostApplication?.bundleIdentifier)
         
-        // Connect debug logging (only if logging is enabled)
-        // Filter to reduce log spam
-        keyboardHandler?.debugLogCallback = { [weak self] message in
-            guard let self = self,
-                  let debugWindow = self.debugWindowController,
-                  debugWindow.isLoggingEnabled else { return }
-            
-            // Filter out verbose messages to reduce lag (unless verbose mode)
-            if debugWindow.isVerboseLogging {
-                debugWindow.logEvent(message)
-            } else {
-                // Always log important messages
-                let shouldLog = message.contains("KEY:") ||
-                               message.contains("CONSUME") ||
-                               message.contains("Inject:") ||
-                               message.contains("BACKSPACE") ||
-                               message.contains("WORD BREAK") ||
-                               message.contains("CURSOR MOVEMENT") ||
-                               message.contains("===") ||
-                               message.contains("DEBUG:") ||  // Read Word logs
-                               message.contains("Text:") ||
-                               message.contains("Word:") ||
-                               message.contains("Valid:") ||
-                               message.contains("Chrome") ||  // Chrome fix logs
-                               message.contains("[AX]")  // Accessibility logs
-                
-                if shouldLog {
-                    debugWindow.logEvent(message)
-                }
-            }
-        }
+        // Debug logging is wired via updateHotPathLogWiring() after the event
+        // tap manager is created (callbacks stay nil while logging is off so
+        // per-keystroke log strings are never built).
 
         // Create event tap manager
         eventTapManager = EventTapManager()
         eventTapManager?.delegate = keyboardHandler
         debugWindowController?.logEvent("Event tap manager created, delegate set")
         
-        // Connect debug logging (only if logging is enabled)
-        // EventTap logs are very verbose, skip most of them
-        eventTapManager?.debugLogCallback = { [weak self] message in
-            guard let self = self,
-                  let debugWindow = self.debugWindowController,
-                  debugWindow.isLoggingEnabled else { return }
-            
-            // Log important EventTap messages (setup, errors, status changes)
-            let shouldLog = message.contains("No delegate") ||
-                           message.contains("disabled") ||
-                           message.contains("started") ||   // Start
-                           message.contains("[OK]") ||      // Success
-                           message.contains("[ERROR]") ||   // Error
-                           message.contains("stopped")      // Stop
-            
-            if shouldLog {
-                debugWindow.logEvent(message)
-            }
-        }
+        // Connect per-keystroke debug logging for handler + event tap
+        updateHotPathLogWiring()
         
         // Setup ForceAccessibilityManager log callback
         ForceAccessibilityManager.shared.logCallback = { [weak self] message in
@@ -632,6 +597,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             macroInEnglishMode: preferences.macroInEnglishMode,
             autoCapsMacro: preferences.autoCapsMacro,
             addSpaceAfterMacro: preferences.addSpaceAfterMacro,
+            yieldMacroToSystemReplacement: preferences.yieldMacroToSystemReplacement,
             smartSwitchEnabled: preferences.smartSwitchEnabled,
             excludedApps: preferences.excludedApps,
             undoTypingEnabled: preferences.undoTypingEnabled
@@ -740,6 +706,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.keyboardHandler?.verboseEngineLogging = isVerbose
                     self?.debugWindowController?.logEvent(isVerbose ? "Verbose engine logging ENABLED (may cause lag)" : "Verbose engine logging DISABLED")
                 }
+
+                // Rewire per-keystroke log callbacks when logging is toggled
+                debugWindowController?.setupLoggingEnabledCallback { [weak self] _ in
+                    self?.updateHotPathLogWiring()
+                }
+
+                // Debug window just got created — wire per-keystroke logging now
+                updateHotPathLogWiring()
                 
                 // Trigger callback immediately with current value to sync initial state
                 // (didSet is not called during property initialization)
@@ -755,6 +729,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 debugWindowController?.onWindowClosed = { [weak self] in
                     self?.debugWindowController = nil
                     DebugLogger.shared.debugWindowController = nil
+                    // Stop building per-keystroke log strings now the window is gone
+                    self?.updateHotPathLogWiring()
                 }
                 debugWindowController?.logEvent("Debug window enabled via settings")
             }
@@ -766,6 +742,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 window.close()
                 debugWindowController = nil
             }
+            // Unwire per-keystroke log callbacks (stop building log strings)
+            updateHotPathLogWiring()
         }
     }
     
@@ -782,6 +760,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Cleanup
         keyboardHandler?.verboseEngineLogging = false
         debugWindowController = nil
+        updateHotPathLogWiring()
 
         // Disconnect from DebugLogger
         DebugLogger.shared.debugWindowController = nil
@@ -1126,6 +1105,69 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Wire or unwire the per-keystroke debug log callbacks.
+    /// While logging is off the callbacks are nil, so hot-path call sites skip
+    /// building log strings entirely (optional chaining short-circuits argument
+    /// evaluation). Must be re-invoked whenever logging is toggled or the debug
+    /// window is created/destroyed.
+    private func updateHotPathLogWiring() {
+        guard let controller = debugWindowController, controller.isLoggingEnabled else {
+            keyboardHandler?.debugLogCallback = nil
+            eventTapManager?.debugLogCallback = nil
+            return
+        }
+
+        // Filter to reduce log spam
+        keyboardHandler?.debugLogCallback = { [weak self] message in
+            guard let self = self,
+                  let debugWindow = self.debugWindowController,
+                  debugWindow.isLoggingEnabled else { return }
+
+            // Filter out verbose messages to reduce lag (unless verbose mode)
+            if debugWindow.isVerboseLogging {
+                debugWindow.logEvent(message)
+            } else {
+                // Always log important messages
+                let shouldLog = message.contains("KEY:") ||
+                               message.contains("CONSUME") ||
+                               message.contains("Inject:") ||
+                               message.contains("BACKSPACE") ||
+                               message.contains("WORD BREAK") ||
+                               message.contains("CURSOR MOVEMENT") ||
+                               message.contains("===") ||
+                               message.contains("DEBUG:") ||  // Read Word logs
+                               message.contains("Text:") ||
+                               message.contains("Word:") ||
+                               message.contains("Valid:") ||
+                               message.contains("Chrome") ||  // Chrome fix logs
+                               message.contains("[AX]")  // Accessibility logs
+
+                if shouldLog {
+                    debugWindow.logEvent(message)
+                }
+            }
+        }
+
+        // EventTap logs are very verbose, skip most of them
+        eventTapManager?.debugLogCallback = { [weak self] message in
+            guard let self = self,
+                  let debugWindow = self.debugWindowController,
+                  debugWindow.isLoggingEnabled else { return }
+
+            // Log important EventTap messages (setup, errors, status changes)
+            let shouldLog = message.contains("No delegate") ||
+                           message.contains("disabled") ||
+                           message.contains("started") ||   // Start
+                           message.contains("[OK]") ||      // Success
+                           message.contains("[ERROR]") ||   // Error
+                           message.contains("stopped")      // Stop
+
+            if shouldLog {
+                debugWindow.logEvent(message)
+            }
+        }
+    }
+
     private func setupAppSwitchObserver() {
         // Listen for app activation changes to reset engine buffer
         // This prevents buffer from previous app affecting typing in new app
@@ -1135,6 +1177,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             queue: .main
         ) { [weak self] notification in
             guard let self = self else { return }
+
+            // Record the new frontmost app for per-keystroke exclusion checks.
+            // The bundle ID comes straight from the notification's userInfo — no
+            // extra IPC. nil falls back to a live NSWorkspace query per keystroke.
+            let activatedApp = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
+            self.keyboardHandler?.noteFrontmostApp(bundleId: activatedApp?.bundleIdentifier)
 
             // Reset keyboard handler engine when switching apps
             // Use resetForAppSwitch() which assumes typing mid-sentence to prevent
@@ -1193,6 +1241,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             
             // Reset intra-app focus tracking (new app = new baseline)
             self.lastFocusedElementSignature = ""
+        }
+
+        // Safety net for the frontmost-app cache: if an app deactivates without a
+        // matching didActivate (rare edge cases), clear the cache so exclusion
+        // checks fall back to a live NSWorkspace query until the next activation.
+        appDeactivateObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didDeactivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.keyboardHandler?.noteFrontmostApp(bundleId: nil)
         }
 
         debugWindowController?.logEvent("App switch observer registered")

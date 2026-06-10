@@ -65,6 +65,9 @@ struct MacroSection: View {
                                     .padding(.leading, 20)
                                 Toggle("Thêm dấu cách sau macro", isOn: $prefsViewModel.preferences.addSpaceAfterMacro)
                                     .padding(.leading, 20)
+                                Toggle("Nhường macro trùng cho Thay thế văn bản của macOS", isOn: $prefsViewModel.preferences.yieldMacroToSystemReplacement)
+                                    .padding(.leading, 20)
+                                    .help("Khi bật, macro có từ viết tắt trùng với Thay thế văn bản (Cài đặt hệ thống → Bàn phím) sẽ bị bỏ qua để macOS tự thay thế. Lưu ý: Thay thế văn bản của macOS không hoạt động ở mọi ứng dụng (ví dụ thanh địa chỉ trình duyệt).")
                             }
                         }
                     }

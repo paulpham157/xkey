@@ -181,4 +181,49 @@ final class MacroManagerTests: XCTestCase {
         XCTAssertFalse(manager.hasMacro(text: "xrev"))
         XCTAssertNil(manager.findMacro(key: searchKey("xrev")))
     }
+
+    // MARK: - Yield to macOS Text Replacement
+
+    func testYieldDisabledExpandsConflictingMacro() {
+        XCTAssertTrue(manager.addMacro(text: "xrev", content: "by the way"))
+        manager.setYieldToSystemReplacement(false)
+        manager.setSystemReplacementShortcuts(["xrev"])
+        XCTAssertNotNil(manager.findMacro(key: searchKey("xrev")))
+    }
+
+    func testYieldEnabledSkipsConflictingMacro() {
+        XCTAssertTrue(manager.addMacro(text: "xrev", content: "by the way"))
+        manager.setYieldToSystemReplacement(true)
+        manager.setSystemReplacementShortcuts(["xrev"])
+        XCTAssertNil(manager.findMacro(key: searchKey("xrev")))
+    }
+
+    func testYieldEnabledKeepsNonConflictingMacro() {
+        XCTAssertTrue(manager.addMacro(text: "xrev", content: "by the way"))
+        manager.setYieldToSystemReplacement(true)
+        manager.setSystemReplacementShortcuts(["omw"])
+        let result = manager.findMacro(key: searchKey("xrev"))
+        XCTAssertNotNil(result)
+        XCTAssertEqual(decode(result!), "by the way")
+    }
+
+    func testYieldSkipsAutoCapsMatchToo() {
+        manager.setAutoCapsMacro(true)
+        XCTAssertTrue(manager.addMacro(text: "xrev", content: "by the way"))
+        manager.setYieldToSystemReplacement(true)
+        manager.setSystemReplacementShortcuts(["xrev"])
+        XCTAssertNil(manager.findMacro(key: searchKey("XREV")))
+        XCTAssertNil(manager.findMacro(key: searchKey("Xrev")))
+    }
+
+    func testYieldComparesCaseInsensitively() {
+        // Macro stored with mixed case still yields to a lowercased TR shortcut.
+        XCTAssertTrue(manager.addMacro(text: "Xrev", content: "by the way"))
+        // Baseline: the mixed-case macro must match at all before yield kicks in,
+        // otherwise the Nil assertion below would pass vacuously.
+        XCTAssertNotNil(manager.findMacro(key: searchKey("Xrev")))
+        manager.setYieldToSystemReplacement(true)
+        manager.setSystemReplacementShortcuts(["xrev"])
+        XCTAssertNil(manager.findMacro(key: searchKey("Xrev")))
+    }
 }

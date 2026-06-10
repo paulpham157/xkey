@@ -21,7 +21,21 @@ class KeyboardEventHandler: EventTapManager.EventTapDelegate {
     
     /// Enable verbose engine logging (causes lag when enabled!)
     /// Only turn on for debugging specific issues
-    var verboseEngineLogging: Bool = false
+    var verboseEngineLogging: Bool = false {
+        didSet { updateEngineLogWiring() }
+    }
+
+    /// Frontmost app bundle ID, updated from NSWorkspace.didActivateApplicationNotification
+    /// (same boundary the rest of the pipeline uses for app-switch state: engine reset,
+    /// confirmed injection method). Avoids an NSWorkspace IPC query on every keystroke.
+    /// nil → isCurrentAppExcluded falls back to a live NSWorkspace query.
+    private var cachedFrontmostBundleId: String?
+
+    /// Record the current frontmost app. Call from the app-activation observer
+    /// (pass the bundle ID from the notification's userInfo) and once at startup.
+    func noteFrontmostApp(bundleId: String?) {
+        cachedFrontmostBundleId = bundleId
+    }
     
     /// Flag to skip updateEngineSettings() during batch updates
     /// This prevents multiple redundant engine updates when applying all settings at once
@@ -87,6 +101,10 @@ class KeyboardEventHandler: EventTapManager.EventTapDelegate {
     @Published var addSpaceAfterMacro: Bool = false {
         didSet { updateEngineSettings() }
     }
+
+    @Published var yieldMacroToSystemReplacement: Bool = false {
+        didSet { updateEngineSettings() }
+    }
     
     // Smart switch
     @Published var smartSwitchEnabled: Bool = true {
@@ -110,17 +128,9 @@ class KeyboardEventHandler: EventTapManager.EventTapDelegate {
         self.engine = VNEngine()
         self.injector = CharacterInjector()
 
-        // Set up engine logging (only logs when verboseEngineLogging is enabled)
-        self.engine.logCallback = { [weak self] message in
-            guard let self = self, self.verboseEngineLogging else { return }
-            self.debugLogCallback?("Engine: \(message)")
-        }
-        
-        // Set up injector debug logging (only logs when verboseEngineLogging is enabled)
-        self.injector.debugCallback = { [weak self] message in
-            guard let self = self, self.verboseEngineLogging else { return }
-            self.debugLogCallback?("Injector: \(message)")
-        }
+        // Set up engine/injector logging (callbacks stay nil while verbose
+        // logging is off — see updateEngineLogWiring)
+        updateEngineLogWiring()
 
         // Share managers with VNEngine
 
@@ -371,11 +381,37 @@ class KeyboardEventHandler: EventTapManager.EventTapDelegate {
         return true
     }
     
-    // Helper to get timestamp for debug logging
-    private func getTimestamp() -> String {
+    /// Wire or unwire engine/injector log closures.
+    /// While verbose logging is off the callbacks are nil, so the engine and the
+    /// injector skip building log strings entirely (they run on every keystroke).
+    private func updateEngineLogWiring() {
+        if verboseEngineLogging {
+            engine.logCallback = { [weak self] message in
+                self?.debugLogCallback?("Engine: \(message)")
+            }
+            injector.debugCallback = { [weak self] message in
+                self?.debugLogCallback?("Injector: \(message)")
+            }
+        } else {
+            engine.logCallback = nil
+            injector.debugCallback = nil
+            // Drop the stale copy CharacterInjector forwarded before verbose was
+            // turned off (it is only refreshed right before each AX injection).
+            AdvancedInjectionMethods.shared.debugCallback = nil
+        }
+    }
+
+    /// Shared formatter — creating a DateFormatter per log line is expensive
+    /// and this runs on the event tap hot path.
+    private static let timestampFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm:ss.SSS"
-        return formatter.string(from: Date())
+        return formatter
+    }()
+
+    // Helper to get timestamp for debug logging
+    private func getTimestamp() -> String {
+        return Self.timestampFormatter.string(from: Date())
     }
     
     func processKeyEvent(_ event: CGEvent, type: CGEventType, proxy: CGEventTapProxy) -> CGEvent? {
@@ -699,6 +735,7 @@ class KeyboardEventHandler: EventTapManager.EventTapDelegate {
         // Update macro manager
         macroManager.setCodeTable(codeTable.rawValue)
         macroManager.setAutoCapsMacro(autoCapsMacro)
+        macroManager.setYieldToSystemReplacement(yieldMacroToSystemReplacement)
     }
     
     /// Apply all settings at once (batch update) - only calls updateEngineSettings() once at the end
@@ -718,6 +755,7 @@ class KeyboardEventHandler: EventTapManager.EventTapDelegate {
         macroInEnglishMode: Bool,
         autoCapsMacro: Bool,
         addSpaceAfterMacro: Bool,
+        yieldMacroToSystemReplacement: Bool,
         smartSwitchEnabled: Bool,
         excludedApps: [ExcludedApp],
         undoTypingEnabled: Bool
@@ -740,6 +778,7 @@ class KeyboardEventHandler: EventTapManager.EventTapDelegate {
         self.macroInEnglishMode = macroInEnglishMode
         self.autoCapsMacro = autoCapsMacro
         self.addSpaceAfterMacro = addSpaceAfterMacro
+        self.yieldMacroToSystemReplacement = yieldMacroToSystemReplacement
         self.smartSwitchEnabled = smartSwitchEnabled
         self.excludedApps = excludedApps
         self.undoTypingEnabled = undoTypingEnabled
@@ -852,9 +891,12 @@ class KeyboardEventHandler: EventTapManager.EventTapDelegate {
             return false  // Overlay apps are never excluded - allow Vietnamese typing
         }
         
-        // PRIORITY 2: Check frontmost application for regular apps
-        guard let frontmostApp = NSWorkspace.shared.frontmostApplication,
-              let bundleId = frontmostApp.bundleIdentifier else {
+        // PRIORITY 2: Check frontmost application for regular apps.
+        // Use the bundle ID cached from didActivateApplicationNotification to avoid
+        // an NSWorkspace IPC round-trip per keystroke; fall back to a live query
+        // when the cache is empty (startup, missing notification userInfo).
+        guard let bundleId = cachedFrontmostBundleId
+                ?? NSWorkspace.shared.frontmostApplication?.bundleIdentifier else {
             return false
         }
         

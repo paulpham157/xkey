@@ -264,6 +264,84 @@ class MacroManager {
     func setAutoCapsMacro(_ enabled: Bool) {
         self.vAutoCapsMacro = enabled
     }
+
+    // MARK: - System Text Replacement Yield
+
+    /// When enabled, a macro whose shortcut also exists in macOS Text Replacements
+    /// (System Settings → Keyboard → Text Replacements) is skipped, letting the
+    /// system replacement apply in fields that support it.
+    private var vYieldToSystemReplacement = false
+
+    /// Lowercased `replace` shortcuts from NSUserDictionaryReplacementItems.
+    /// Guarded by `systemReplacementLock`: read on the event-tap thread in
+    /// `findMacro`, replaced wholesale by background refreshes.
+    private var systemReplacementShortcuts: Set<String> = []
+    private var systemReplacementLoadedAt: CFAbsoluteTime = 0
+    private var systemReplacementRefreshInFlight = false
+    private let systemReplacementLock = NSLock()
+    private static let systemReplacementTTL: CFAbsoluteTime = 60
+
+    func setYieldToSystemReplacement(_ enabled: Bool) {
+        let wasEnabled = vYieldToSystemReplacement
+        vYieldToSystemReplacement = enabled
+        if enabled && !wasEnabled {
+            reloadSystemReplacementShortcuts()
+        }
+    }
+
+    /// Read macOS Text Replacements from the global defaults domain.
+    /// Items look like: { on = 1; replace = "btw"; with = "by the way"; }
+    func reloadSystemReplacementShortcuts() {
+        var shortcuts: Set<String> = []
+        if let items = UserDefaults.standard.array(forKey: "NSUserDictionaryReplacementItems") as? [[String: Any]] {
+            shortcuts.reserveCapacity(items.count)
+            for item in items {
+                // Missing "on" means enabled; 0 means the user disabled the entry
+                if let on = item["on"] as? Int, on == 0 { continue }
+                if let replace = item["replace"] as? String, !replace.isEmpty {
+                    shortcuts.insert(replace.lowercased())
+                }
+            }
+        }
+        systemReplacementLock.lock()
+        systemReplacementShortcuts = shortcuts
+        systemReplacementLoadedAt = CFAbsoluteTimeGetCurrent()
+        systemReplacementRefreshInFlight = false
+        systemReplacementLock.unlock()
+    }
+
+    /// Test hook: inject the shortcut set without reading UserDefaults.
+    func setSystemReplacementShortcuts(_ shortcuts: Set<String>) {
+        systemReplacementLock.lock()
+        systemReplacementShortcuts = shortcuts
+        systemReplacementLoadedAt = CFAbsoluteTimeGetCurrent()
+        systemReplacementLock.unlock()
+    }
+
+    /// Called only on a macro hit: one Set lookup under lock. Schedules an async
+    /// refresh once the cache passes TTL so edits in System Settings get picked up.
+    private func shouldYieldToSystemReplacement(_ macroText: String) -> Bool {
+        guard vYieldToSystemReplacement else { return false }
+        refreshSystemReplacementsIfStale()
+        systemReplacementLock.lock()
+        defer { systemReplacementLock.unlock() }
+        return systemReplacementShortcuts.contains(macroText.lowercased())
+    }
+
+    private func refreshSystemReplacementsIfStale() {
+        let now = CFAbsoluteTimeGetCurrent()
+        systemReplacementLock.lock()
+        let stale = (now - systemReplacementLoadedAt) > Self.systemReplacementTTL
+        let shouldRefresh = stale && !systemReplacementRefreshInFlight
+        if shouldRefresh {
+            systemReplacementRefreshInFlight = true
+        }
+        systemReplacementLock.unlock()
+        guard shouldRefresh else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.reloadSystemReplacementShortcuts()
+        }
+    }
     
     /// Public wrapper for getCharacterCode - converts internal data to Unicode character code
     /// Used by VNEngine.getMacroKeyAsString() for context-aware macro checking
@@ -313,6 +391,7 @@ class MacroManager {
 
         // Try exact match first
         if let macro = macroMap[searchKey] {
+            if shouldYieldToSystemReplacement(macro.macroText) { return nil }
             return macro.macroContentCode
         }
         
@@ -346,6 +425,7 @@ class MacroManager {
             
             // Try to find macro with lowercase key
             if let macro = macroMap[lowercaseKey] {
+                if shouldYieldToSystemReplacement(macro.macroText) { return nil }
                 var result = macro.macroContentCode
                 
                 // Apply caps to result based on input case

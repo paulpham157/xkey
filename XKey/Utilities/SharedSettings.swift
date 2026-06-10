@@ -51,6 +51,7 @@ enum SharedSettingsKey: String {
     case macroInEnglishMode = "XKey.macroInEnglishMode"
     case autoCapsMacro = "XKey.autoCapsMacro"
     case addSpaceAfterMacro = "XKey.addSpaceAfterMacro"
+    case yieldMacroToSystemReplacement = "XKey.yieldMacroToSystemReplacement"
     case macros = "XKey.macros"
 
     // Smart switch settings
@@ -173,9 +174,58 @@ class SharedSettings {
         return prefsDir.appendingPathComponent("\(kXKeyAppGroup).plist")
     }()
     
+    // MARK: - In-Memory Cache
+
+    /// Guards cachedPlistDict / cachedUserDictionaryWords (NSLock is NOT reentrant —
+    /// never call another locking method while holding it).
+    private let cacheLock = NSLock()
+
+    /// Cached plist dictionary so per-keystroke setting reads (spell check, engine
+    /// flags, ...) don't hit disk. The main app is the only writer; writes update
+    /// this cache directly. XKeyIM only reads and refreshes via the distributed
+    /// settings-changed notification that accompanies every write.
+    private var cachedPlistDict: [String: Any]?
+
+    /// Cached decoded user dictionary so per-word spell checks don't re-decode JSON.
+    private var cachedUserDictionaryWords: Set<String>?
+
+    /// Bumped on every write/invalidation (under cacheLock). Lets
+    /// getUserDictionaryWords detect that the data changed while it was
+    /// decoding outside the lock, so it never caches a stale Set.
+    private var cacheGeneration = 0
+
+    /// Identifies this process in distributed settings notifications so our own
+    /// observer can skip invalidating the cache that writePlistDict just updated.
+    private static let processTag = "xkey-\(ProcessInfo.processInfo.processIdentifier)"
+
     // MARK: - Initialization
 
-    private init() {}
+    private init() {
+        // Refresh cache when settings change in another process
+        // (XKeyIM receives main-app writes; the main app receiving its own
+        // notification just causes one extra disk read per settings change).
+        // Block-based observer: SharedSettings is not an NSObject, so the
+        // selector-based API is unavailable. The singleton never deallocates,
+        // so the observation token is intentionally not removed.
+        DistributedNotificationCenter.default().addObserver(
+            forName: .xkeySettingsDidChange,
+            object: nil,
+            queue: nil
+        ) { [weak self] notification in
+            // Skip our own writes — writePlistDict already updated the cache
+            if (notification.object as? String) == Self.processTag { return }
+            self?.invalidateCache()
+        }
+    }
+
+    /// Drop all cached values; the next read reloads from disk
+    func invalidateCache() {
+        cacheLock.lock()
+        cachedPlistDict = nil
+        cachedUserDictionaryWords = nil
+        cacheGeneration += 1
+        cacheLock.unlock()
+    }
     
     /// Public read-only access to the plist file path (for debug/diagnostics)
     var settingsFilePath: String {
@@ -184,23 +234,43 @@ class SharedSettings {
 
     // MARK: - Plist Read/Write Helpers
     
-    /// Read the entire plist dictionary
+    /// Read the entire plist dictionary (served from the in-memory cache when warm)
     private func readPlistDict() -> [String: Any] {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+
+        if let cached = cachedPlistDict {
+            return cached
+        }
+
         guard let url = plistURL,
               let data = try? Data(contentsOf: url),
               let dict = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
+            // Don't cache failures (missing file on fresh install, transient
+            // read error) — keep retrying from disk until a successful read/write.
             return [:]
         }
+
+        cachedPlistDict = dict
         return dict
     }
-    
+
     /// Write the entire plist dictionary
     private func writePlistDict(_ dict: [String: Any]) {
         guard let url = plistURL else { return }
-        
+
         do {
             let data = try PropertyListSerialization.data(fromPropertyList: dict, format: .binary, options: 0)
+
+            // Disk write + cache update under one lock hold so a concurrent
+            // reader can never observe cache/disk divergence. On write failure
+            // the cache is left untouched (still matches disk).
+            cacheLock.lock()
+            defer { cacheLock.unlock() }
             try data.write(to: url)
+            cachedPlistDict = dict
+            cachedUserDictionaryWords = nil
+            cacheGeneration += 1
         } catch {
             sharedLogError("Failed to write plist: \(error)")
         }
@@ -494,6 +564,11 @@ class SharedSettings {
     var addSpaceAfterMacro: Bool {
         get { readBool(forKey: SharedSettingsKey.addSpaceAfterMacro.rawValue) }
         set { writeBool(newValue, forKey: SharedSettingsKey.addSpaceAfterMacro.rawValue) }
+    }
+
+    var yieldMacroToSystemReplacement: Bool {
+        get { readBool(forKey: SharedSettingsKey.yieldMacroToSystemReplacement.rawValue) }
+        set { writeBool(newValue, forKey: SharedSettingsKey.yieldMacroToSystemReplacement.rawValue) }
     }
 
     func getMacros() -> Data? {
@@ -901,11 +976,31 @@ class SharedSettings {
     
     /// Get the list of user-defined words (to skip spell check)
     func getUserDictionaryWords() -> Set<String> {
-        guard let data = readData(forKey: SharedSettingsKey.userDictionaryWords.rawValue),
-              let words = try? JSONDecoder().decode([String].self, from: data) else {
-            return []
+        cacheLock.lock()
+        let cached = cachedUserDictionaryWords
+        let generation = cacheGeneration
+        cacheLock.unlock()
+        if let cached = cached {
+            return cached
         }
-        return Set(words)
+
+        // Decode outside the lock — readData() takes cacheLock internally.
+        let words: Set<String>
+        if let data = readData(forKey: SharedSettingsKey.userDictionaryWords.rawValue),
+           let list = try? JSONDecoder().decode([String].self, from: data) {
+            words = Set(list)
+        } else {
+            words = []
+        }
+
+        cacheLock.lock()
+        // Only cache if no write/invalidation happened while we were decoding —
+        // otherwise this Set may be stale and would be served indefinitely.
+        if cacheGeneration == generation {
+            cachedUserDictionaryWords = words
+        }
+        cacheLock.unlock()
+        return words
     }
     
     /// Set the list of user-defined words
@@ -983,10 +1078,18 @@ class SharedSettings {
             object: nil
         )
 
-        // Post distributed notification for cross-app communication
-        DistributedNotificationCenter.default().post(
-            name: .xkeySettingsDidChange,
-            object: nil
+        // Post distributed notification for cross-app communication.
+        // object carries the sender's process tag so our own observer can skip
+        // the redundant cache invalidation (XKeyIM observes with object: nil
+        // and is unaffected by the object value).
+        // deliverImmediately: XKeyIM is a background IMK process — without it
+        // the notification can be coalesced/held and its settings cache would
+        // stay stale until the next delivery.
+        DistributedNotificationCenter.default().postNotificationName(
+            .xkeySettingsDidChange,
+            object: Self.processTag,
+            userInfo: nil,
+            deliverImmediately: true
         )
     }
     
@@ -1251,7 +1354,10 @@ class SharedSettings {
                 return false
             }
         }
-        
+
+        // Cache must not outlive the deleted plist
+        invalidateCache()
+
         // Notify all observers that settings have been reset
         notifySettingsChanged()
         notifyToolbarChanged()
@@ -1342,6 +1448,7 @@ class SharedSettings {
         prefs.macroInEnglishMode = macroInEnglishMode
         prefs.autoCapsMacro = autoCapsMacro
         prefs.addSpaceAfterMacro = addSpaceAfterMacro
+        prefs.yieldMacroToSystemReplacement = yieldMacroToSystemReplacement
 
         prefs.smartSwitchEnabled = smartSwitchEnabled
 
@@ -1502,6 +1609,7 @@ class SharedSettings {
         macroInEnglishMode = prefs.macroInEnglishMode
         autoCapsMacro = prefs.autoCapsMacro
         addSpaceAfterMacro = prefs.addSpaceAfterMacro
+        yieldMacroToSystemReplacement = prefs.yieldMacroToSystemReplacement
 
         smartSwitchEnabled = prefs.smartSwitchEnabled
 
@@ -1564,6 +1672,12 @@ class SharedSettings {
         translateToSourceAutoHideSeconds = prefs.translateToSourceAutoHideSeconds
         translationResultAutoHideSeconds = prefs.translationResultAutoHideSeconds
 
+        // Debug settings — written BEFORE the notifications below so observers
+        // (XKeyIM) never re-read the plist while these are still unwritten
+        debugModeEnabled = prefs.debugModeEnabled
+        debugHotkeyCode = prefs.debugHotkey.keyCode
+        debugHotkeyModifiers = prefs.debugHotkey.modifiers.rawValue
+
         // Batch update is done - settings are already written to plist via setters
         isBatchUpdating = false
 
@@ -1578,11 +1692,6 @@ class SharedSettings {
 
         // Also notify translation settings changed
         notifyTranslationSettingsChanged()
-
-        // Debug settings
-        debugModeEnabled = prefs.debugModeEnabled
-        debugHotkeyCode = prefs.debugHotkey.keyCode
-        debugHotkeyModifiers = prefs.debugHotkey.modifiers.rawValue
 
         // Also notify debug settings changed
         notifyDebugSettingsChanged()

@@ -3117,6 +3117,22 @@
         }
       }
     },
+    "Khi bật, macro có từ viết tắt trùng với Thay thế văn bản (Cài đặt hệ thống → Bàn phím) sẽ bị bỏ qua để macOS tự thay thế. Lưu ý: Thay thế văn bản của macOS không hoạt động ở mọi ứng dụng (ví dụ thanh địa chỉ trình duyệt).": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "When enabled, macros whose shortcut matches a Text Replacement (System Settings → Keyboard) are skipped so macOS performs the replacement. Note: macOS Text Replacement does not work in every app (e.g. browser address bars)."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "启用后，缩写与文本替换（系统设置 → 键盘）相同的宏将被跳过，由 macOS 执行替换。注意：macOS 文本替换并非在所有应用中都有效（例如浏览器地址栏）。"
+          }
+        }
+      }
+    },
     "Khi focus vào ô nhập liệu, thanh công cụ nhỏ sẽ hiện ra cho phép bạn đổi ngôn ngữ nguồn/đích nhanh chóng mà không cần mở Thiết lập.": {
       "localizations": {
         "en": {
@@ -4478,6 +4494,22 @@
           "stringUnit": {
             "state": "translated",
             "value": "翻译提供商返回无效结果。请重试。"
+          }
+        }
+      }
+    },
+    "Nhường macro trùng cho Thay thế văn bản của macOS": {
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Yield conflicting macros to macOS Text Replacement"
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "与 macOS 文本替换冲突的宏让位给系统"
           }
         }
       }
