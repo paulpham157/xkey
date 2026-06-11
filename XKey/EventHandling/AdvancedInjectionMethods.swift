@@ -10,8 +10,9 @@ import Cocoa
 import Carbon
 
 // MARK: - Advanced Injection Methods (Library)
-// These are additional injection methods that can be activated for specific apps
-// Currently not integrated into the main injection flow
+// Additional injection methods for specific apps. axDirect is integrated into
+// the main flow via CharacterInjector.injectSync; selectAll is not (see Usage
+// Example at the bottom of this file).
 
 /// Advanced injection utilities for special cases
 /// - selectAll: For apps with aggressive autocomplete (Arc browser)
@@ -93,79 +94,170 @@ class AdvancedInjectionMethods {
     }
     
     // MARK: - AX Direct Injection
-    // For apps where synthetic keyboard events don't work (Spotlight, Firefox)
-    // Uses Accessibility API to directly manipulate text field value
-    
-    /// AX API injection: Directly manipulate text field via Accessibility API
-    /// Used for Spotlight/Arc where synthetic keyboard events are unreliable due to autocomplete
+    // For overlay search fields (Spotlight/Raycast/Alfred) and Firefox-style content
+    // areas where synthetic keyboard events race with inline autocomplete.
+    // Uses the Accessibility API to replace text atomically — immune to that race.
+
+    /// AX API injection: directly replace text in the focused field via Accessibility API.
+    ///
+    /// All offset arithmetic is done in **UTF-16 code units** because AX reports
+    /// `kAXSelectedTextRange` in UTF-16. Vietnamese diacritics make grapheme count
+    /// differ from UTF-16 count, so mixing the two (as a naive `String.count` would)
+    /// corrupts the cut positions. We use `NSString`, whose indices are UTF-16 native.
+    ///
+    /// Two strategies are attempted (mirroring battle-tested IME behavior):
+    ///   1. Selection-based: set `kAXSelectedTextRange` over the chars to replace
+    ///      (including any auto-selected autocomplete suggestion), then set
+    ///      `kAXSelectedText`. Cleanest; preserves the field's own undo/scroll state.
+    ///   2. Full-value rewrite: read `kAXValue`, splice, write it back, restore caret.
+    ///      Used when the field rejects selection-based editing.
     ///
     /// - Parameters:
-    ///   - bs: Number of characters to backspace
+    ///   - bs: Number of UTF-16 code units to delete before the cursor.
+    ///     Callers pass backspace-key counts; the two match because injected
+    ///     Vietnamese is precomposed BMP (1 key press == 1 UTF-16 unit). A field
+    ///     holding decomposed (NFD) content would be under-deleted — acceptable,
+    ///     since XKey itself always writes precomposed text.
     ///   - text: Replacement text to insert
-    /// - Returns: true if successful, false if caller should fallback to synthetic events
+    /// - Returns: true if successful, false if caller should fall back to synthetic events
     func injectViaAX(bs: Int, text: String) -> Bool {
         // Get focused element
         guard let axEl = AXHelper.getFocusedElement() else {
             debugCallback?("[AX] No focused element")
             return false
         }
-        
-        // Read current text value
-        guard let fullText = AXHelper.getString(axEl, attribute: kAXValueAttribute) else {
-            debugCallback?("[AX] No value attribute")
+
+        // Cap per-call AX IPC latency on this element, tighter than the process-wide
+        // default set at startup (AXHelper.setGlobalMessagingTimeout): injection runs
+        // synchronously on the event-tap thread for every keystroke, so an
+        // unresponsive app (e.g. Spotlight mid-search) must fail fast here.
+        AXUIElementSetMessagingTimeout(axEl, 0.1)
+
+        // Field length in UTF-16 units. kAXNumberOfCharacters is a cheap scalar
+        // query; reading kAXValue copies the whole field content, so defer that to
+        // Strategy 2 — its only consumer.
+        var cachedFullText: NSString?
+        let total: Int
+        if let count = AXHelper.getInt(axEl, attribute: kAXNumberOfCharactersAttribute as CFString) {
+            total = count
+        } else if let value = AXHelper.getString(axEl, attribute: kAXValueAttribute) {
+            let ns = value as NSString
+            cachedFullText = ns
+            total = ns.length
+        } else {
+            debugCallback?("[AX] No character count or value attribute")
             return false
         }
-        
-        // Read cursor position and selection
+
+        // Read cursor position and selection (UTF-16 offsets)
         guard let range = AXHelper.getRange(axEl, attribute: kAXSelectedTextRangeAttribute),
               range.location >= 0 else {
             debugCallback?("[AX] No selected text range")
             return false
         }
-        
-        let cursor = range.location
-        let selection = range.length
-        
-        // Handle autocomplete: when selection > 0, text after cursor is autocomplete suggestion
-        // Example: "a|rc://chrome-urls" where "|" is cursor, "rc://..." is selected suggestion
-        let userText = (selection > 0 && cursor <= fullText.count)
-            ? String(fullText.prefix(cursor))
-            : fullText
-        
-        // Calculate replacement: delete `bs` chars before cursor, insert `text`
+
+        // Clamp defensively against stale/inconsistent AX reports.
+        let cursor = min(range.location, total)
+        let selection = max(0, min(range.length, total - cursor))
+
+        // Autocomplete handling: when selection > 0, the text from the cursor onward is
+        // the inline suggestion the overlay auto-selected (e.g. "a|rc://..." where "|" is
+        // the cursor and "rc://..." is selected). We replace the chars before the cursor
+        // AND that selected suggestion together so it does not linger.
         let deleteStart = max(0, cursor - bs)
-        let prefix = String(userText.prefix(deleteStart))
-        let suffix = String(userText.dropFirst(cursor))
-        let newText = (prefix + text + suffix).precomposedStringWithCanonicalMapping
-        
-        // Write new value
-        guard AXHelper.setValue(axEl, attribute: kAXValueAttribute, value: newText as CFTypeRef) == .success else {
-            debugCallback?("[AX] Write failed")
+        let replaceLength = (cursor - deleteStart) + selection
+
+        // Bounds check before touching the field.
+        guard deleteStart >= 0, deleteStart + replaceLength <= total else {
+            debugCallback?("[AX] Range out of bounds (start=\(deleteStart) len=\(replaceLength) total=\(total))")
             return false
         }
-        
-        // Update cursor to end of inserted text
-        var newCursor = CFRange(location: deleteStart + text.count, length: 0)
-        if let newRange = AXValueCreate(.cfRange, &newCursor) {
-            AXHelper.setValue(axEl, attribute: kAXSelectedTextRangeAttribute, value: newRange)
+
+        let insert = text.precomposedStringWithCanonicalMapping
+
+        // --- Strategy 1: selection-based replacement (surgical) ---
+        // Two AX writes (set range, then set text), so not strictly atomic: the app's
+        // own async suggestion refresh can still mutate the field between them. The
+        // window is far smaller than the synthetic-event path, but not zero.
+        var replaceRange = CFRange(location: deleteStart, length: replaceLength)
+        var selectionMutated = false
+        if let replaceRangeVal = AXValueCreate(.cfRange, &replaceRange),
+           AXHelper.setValue(axEl, attribute: kAXSelectedTextRangeAttribute, value: replaceRangeVal) == .success {
+            selectionMutated = true
+            if AXHelper.setValue(axEl, attribute: kAXSelectedTextAttribute, value: insert as CFTypeRef) == .success {
+                debugCallback?("[AX] Success (selection): bs=\(bs), text=\"\(text)\"")
+                return true
+            }
         }
 
-        debugCallback?("[AX] Success: bs=\(bs), text=\(text)")
+        // If Strategy 1 moved the selection but could not complete the edit, restore
+        // the original selection before giving up — otherwise the synthetic fallback's
+        // first delete would wipe the whole leftover selection and over-delete.
+        func restoreOriginalSelection() {
+            guard selectionMutated else { return }
+            var original = CFRange(location: cursor, length: selection)
+            if let originalVal = AXValueCreate(.cfRange, &original) {
+                AXHelper.setValue(axEl, attribute: kAXSelectedTextRangeAttribute, value: originalVal)
+            }
+        }
+
+        // --- Strategy 2: full-value rewrite (fallback for stubborn fields) ---
+        // Strategy 1 only touched the selection, never the value, so a value read
+        // here is still consistent with `total` unless the app changed it under us
+        // (guarded below).
+        guard let fullText = cachedFullText
+                ?? AXHelper.getString(axEl, attribute: kAXValueAttribute).map({ $0 as NSString }),
+              fullText.length == total else {
+            debugCallback?("[AX] Value unavailable or stale for full rewrite")
+            restoreOriginalSelection()
+            return false
+        }
+        let prefix = fullText.substring(to: deleteStart)
+        let suffix = fullText.substring(from: deleteStart + replaceLength)
+        let newText = (prefix + insert + suffix).precomposedStringWithCanonicalMapping
+
+        guard AXHelper.setValue(axEl, attribute: kAXValueAttribute, value: newText as CFTypeRef) == .success else {
+            debugCallback?("[AX] Write failed (both strategies)")
+            restoreOriginalSelection()
+            return false
+        }
+
+        // Restore caret to the end of the inserted text. Computed from the recomposed
+        // prefix+insert because canonical recomposition can merge characters across
+        // the boundary, shifting UTF-16 offsets.
+        var caret = CFRange(
+            location: ((prefix + insert).precomposedStringWithCanonicalMapping as NSString).length,
+            length: 0
+        )
+        if let caretVal = AXValueCreate(.cfRange, &caret) {
+            AXHelper.setValue(axEl, attribute: kAXSelectedTextRangeAttribute, value: caretVal)
+        }
+
+        debugCallback?("[AX] Success (full value): bs=\(bs), text=\"\(text)\"")
         return true
     }
     
     /// Try AX injection with retries, fallback to callback if all fail
-    /// Spotlight can be busy searching, causing AX API to fail temporarily
+    /// Spotlight/Raycast/Alfred can be busy searching, causing AX API to fail temporarily
     ///
     /// - Parameters:
-    ///   - bs: Number of characters to backspace
+    ///   - bs: Number of UTF-16 code units to delete before the cursor
     ///   - text: Replacement text to insert
-    ///   - fallback: Closure to call if AX injection fails
-    /// - Note: NOT YET INTEGRATED - Ready for future use
+    ///   - fallback: Closure to call if AX injection fails (synthetic-event path)
+    /// - Note: Integrated via CharacterInjector.injectSync (.axDirect) for overlay
+    ///   launchers and Firefox-style address bars.
     func injectViaAXWithFallback(bs: Int, text: String, fallback: () -> Void) {
-        // Try AX API up to 3 times (Spotlight might be busy)
+        // Try AX API up to 3 times (Spotlight might be busy), but stop retrying
+        // once ~250ms have elapsed: we run synchronously on the event-tap thread,
+        // and retries only help with transient failures — a consistently slow app
+        // should drop to the synthetic fallback instead of stalling input.
+        let retryDeadline = DispatchTime.now() + .milliseconds(250)
         for attempt in 0..<3 {
             if attempt > 0 {
+                if DispatchTime.now() >= retryDeadline {
+                    debugCallback?("[AX] Retry budget exhausted")
+                    break
+                }
                 usleep(5000)  // 5ms delay before retry
             }
             if injectViaAX(bs: bs, text: text) {

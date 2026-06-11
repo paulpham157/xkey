@@ -107,6 +107,51 @@ class CharacterInjector {
         let charPreview = characters.map { $0.unicode(codeTable: codeTable) }.joined()
         debugCallback?("Inject: bs=\(backspaceCount), chars=\(characters.count), text=\"\(charPreview)\", method=\(method), textMode=\(textSendingMethod), emptyCharPrefix=\(methodInfo.needsEmptyCharPrefix)")
 
+        // AX Direct replaces text in one AX edit (delete `bs` units + insert), so it
+        // does NOT follow the Step 1 (backspace) → Step 2 (text) model below.
+        //
+        // bs==0 goes through AX only for overlay launchers: their fields auto-select
+        // an inline suggestion that must be cleared atomically even on a plain insert.
+        // Other .axDirect contexts (Firefox-style content areas / address bars) keep
+        // the synthetic Step 2 path for bs==0 — there is no suggestion to clear, and
+        // routing every plain keystroke through AX would cost 4-6 IPC round-trips and
+        // risk a full-value rewrite of large fields.
+        if method == .axDirect && (backspaceCount > 0 || methodInfo.isOverlay) {
+            // AX Direct: Use Accessibility API to manipulate text atomically.
+            // Primary path for overlay launchers (Spotlight/Raycast/Alfred) and
+            // Firefox-style content areas — both race with synthetic events.
+            debugCallback?("    → AX Direct method: bs=\(backspaceCount), text=\"\(charPreview)\"")
+            // Forward debug callback to AdvancedInjectionMethods
+            AdvancedInjectionMethods.shared.debugCallback = debugCallback
+            // Choose the synthetic fallback per context (used only if AX fails 3×):
+            // - Overlay launchers have inline autocomplete → Forward Delete + backspace
+            //   clears the auto-selected suggestion before retyping.
+            // - Firefox content areas have no such suggestion → plain backspace + text
+            //   (Shift+Left selection is unreliable there, e.g. "dịch" → "diịch").
+            let isOverlayContext = methodInfo.isOverlay
+            AdvancedInjectionMethods.shared.injectViaAXWithFallback(bs: backspaceCount, text: charPreview) {
+                if isOverlayContext {
+                    let skipFwdDel = !self.shouldSendForwardDeleteForAutocomplete()
+                    self.debugCallback?("    → AX failed, fallback to autocomplete (skipFwdDel=\(skipFwdDel))")
+                    self.injectViaAutocompleteInternal(count: backspaceCount, delays: delays, proxy: proxy, skipForwardDelete: skipFwdDel)
+                } else {
+                    self.debugCallback?("    → AX failed, fallback to backspace + text")
+                    for i in 0..<backspaceCount {
+                        self.sendKeyPress(VietnameseData.KEY_DELETE, proxy: proxy)
+                        usleep(1000)
+                        self.debugCallback?("    → Backspace \(i + 1)/\(backspaceCount)")
+                    }
+                    if backspaceCount > 0 {
+                        usleep(3000)  // Wait for backspaces to be processed
+                    }
+                }
+                self.sendTextChunkedInternal(charPreview, delay: delays.text, proxy: proxy, useDirectPost: false)
+            }
+            // AX Direct handles both backspace and text insertion (or fallback does)
+            debugCallback?("injectSync: complete (AX Direct)")
+            return
+        }
+
         // Step 1: Send backspaces
         if backspaceCount > 0 {
             switch method {
@@ -123,30 +168,8 @@ class CharacterInjector {
                 injectViaAutocompleteInternal(count: backspaceCount, delays: delays, proxy: proxy, skipForwardDelete: !shouldForwardDelete)
 
             case .axDirect:
-                // AX Direct: Use Accessibility API to manipulate text directly
-                // Used for Firefox-based browsers content area where keyboard events don't work well
-                debugCallback?("    → AX Direct method: bs=\(backspaceCount), text=\"\(charPreview)\"")
-                // Forward debug callback to AdvancedInjectionMethods
-                AdvancedInjectionMethods.shared.debugCallback = debugCallback
-                AdvancedInjectionMethods.shared.injectViaAXWithFallback(bs: backspaceCount, text: charPreview) {
-                    // Fallback: use backspace + text instead of Shift+Left selection
-                    // Shift+Left selection is unreliable in Firefox content areas,
-                    // causing characters to be inserted without replacing (e.g., "dịch" → "diịch")
-                    // Backspace is universally reliable across all apps
-                    self.debugCallback?("    → AX failed, fallback to backspace + text")
-                    for i in 0..<backspaceCount {
-                        self.sendKeyPress(VietnameseData.KEY_DELETE, proxy: proxy)
-                        usleep(1000)
-                        self.debugCallback?("    → Backspace \(i + 1)/\(backspaceCount)")
-                    }
-                    if backspaceCount > 0 {
-                        usleep(3000)  // Wait for backspaces to be processed
-                    }
-                    self.sendTextChunkedInternal(charPreview, delay: delays.text, proxy: proxy, useDirectPost: false)
-                }
-                // AX Direct handles both backspace and text insertion (or fallback does), so skip Step 2
-                debugCallback?("injectSync: complete (AX Direct)")
-                return
+                // Unreachable: backspaceCount > 0 is always handled before Step 1.
+                break
 
             case .slow, .fast:
                 // Empty char prefix: send U+202F to break autocomplete before backspaces

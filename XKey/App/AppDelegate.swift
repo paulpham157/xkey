@@ -183,6 +183,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             keyboardHandler = KeyboardEventHandler()
             return
         }
+
+        // Bound every AX call this process makes. Detection probes and AX
+        // injection run on the event-tap thread for each keystroke; a hung
+        // focused app must degrade them to their synthetic fallbacks instead
+        // of stalling input until macOS disables the event tap.
+        AXHelper.setGlobalMessagingTimeout(0.25)
         
         // Create debug window first
         setupDebugWindow()

@@ -577,23 +577,20 @@ class KeyboardEventHandler: EventTapManager.EventTapDelegate {
                 
                 // Check if macro was found and replaced, or restore happened
                 if result.shouldConsume {
-                    // Send backspaces
-                    if result.backspaceCount > 0 {
-                        injector.sendBackspaces(
-                            count: result.backspaceCount,
-                            codeTable: codeTable,
-                            proxy: proxy
-                        )
-                    }
-                    
-                    // Send replacement characters (includes the space character for restore/macro)
-                    if !result.newCharacters.isEmpty {
-                        injector.sendCharacters(result.newCharacters, codeTable: codeTable, proxy: proxy)
-                    }
-                    
-                    // IMPORTANT: When restore or macro replacement happens, the space character
-                    // is already included in result.newCharacters. We must consume the event
-                    // to prevent a double space from being inserted.
+                    // Atomic backspace + replacement in one operation (consistent with
+                    // handleCharacter/handleBackspace). This prevents a keystroke from
+                    // interleaving between the deletion and the re-type, and routes overlay
+                    // launchers (Spotlight/Raycast/Alfred) through the AX atomic path.
+                    //
+                    // newCharacters already includes the trailing space/newline for
+                    // restore/macro, so we consume the original event to avoid a double space.
+                    injector.injectSync(
+                        backspaceCount: result.backspaceCount,
+                        characters: result.newCharacters,
+                        codeTable: codeTable,
+                        proxy: proxy
+                    )
+
                     return nil
                 }
             } else {

@@ -162,6 +162,23 @@ enum AXHelper {
         return AXUIElementSetAttributeValue(element, attribute as CFString, value)
     }
     
+    // MARK: - Global Messaging Timeout
+
+    /// Caps how long any AX call from this process may block waiting on the
+    /// target app. Per Apple docs, setting a messaging timeout on the
+    /// system-wide element applies it process-globally; a timeout set on a
+    /// specific element (AXUIElementSetMessagingTimeout on that element)
+    /// still overrides it for that element.
+    ///
+    /// XKey issues AX queries on the event-tap thread on every keystroke; the
+    /// system default (~6s) is long enough for a hung focused app to get the
+    /// event tap disabled by kCGEventTapDisabledByTimeout. All AX call sites
+    /// already degrade gracefully on nil/failure, so a short global cap is
+    /// strictly safer.
+    static func setGlobalMessagingTimeout(_ seconds: Float) {
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), seconds)
+    }
+
     // MARK: - Convenience: Window Title
     
     /// Get window title for an app element (tries focused window → main window → first window)

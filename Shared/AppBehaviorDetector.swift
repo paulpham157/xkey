@@ -149,13 +149,19 @@ struct InjectionMethodInfo {
     /// Configuration for paste text sending method (only used when textSendingMethod == .paste)
     let pasteConfig: PasteConfig
 
-    init(method: InjectionMethod, delays: InjectionDelays, textSendingMethod: TextSendingMethod, description: String, needsEmptyCharPrefix: Bool = false, pasteConfig: PasteConfig = PasteConfig()) {
+    /// True for overlay launchers (Spotlight/Raycast/Alfred). Their search fields
+    /// auto-select an inline autocomplete suggestion, so even a zero-backspace
+    /// insert must go through the AX atomic path to clear it.
+    let isOverlay: Bool
+
+    init(method: InjectionMethod, delays: InjectionDelays, textSendingMethod: TextSendingMethod, description: String, needsEmptyCharPrefix: Bool = false, pasteConfig: PasteConfig = PasteConfig(), isOverlay: Bool = false) {
         self.method = method
         self.delays = delays
         self.textSendingMethod = textSendingMethod
         self.description = description
         self.needsEmptyCharPrefix = needsEmptyCharPrefix
         self.pasteConfig = pasteConfig
+        self.isOverlay = isOverlay
     }
     
     static let defaultFast = InjectionMethodInfo(
@@ -2241,13 +2247,20 @@ class AppBehaviorDetector {
         // MUST check this BEFORE browser address bar and Window Title Rules because:
         // - Spotlight opens as overlay while Chrome may still be "frontmost app"
         // - Window Title Rules (like Google Docs) would match first without this check
-        // - Spotlight/Raycast/Alfred need .autocomplete method
+        //
+        // Overlay search fields process input asynchronously with inline autocomplete,
+        // so synthesized backspaces race with the live completion (the first backspace
+        // only clears the selected suggestion), scrambling fast typing. We use .axDirect
+        // to edit the focused text field atomically via the Accessibility API instead —
+        // this is immune to that race. injectViaAX falls back to the .autocomplete
+        // synthetic path (Forward Delete + backspace) when AX is unavailable.
         if let overlayName = overlayAppNameProvider?() {
             return InjectionMethodInfo(
-                method: .autocomplete,
-                delays: InjectionMethod.autocomplete.defaultDelays,
+                method: .axDirect,
+                delays: InjectionMethod.axDirect.defaultDelays,
                 textSendingMethod: .chunked,
-                description: "\(overlayName) (Overlay Launcher)"
+                description: "\(overlayName) (Overlay Launcher)",
+                isOverlay: true
             )
         }
 
