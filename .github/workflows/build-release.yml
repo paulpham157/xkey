@@ -353,17 +353,25 @@ jobs:
           SPARKLE_BIN="/tmp/Sparkle-$SPARKLE_VERSION/bin"
           DMG_PATH="$GITHUB_WORKSPACE/Release/$DMG_NAME"
           
-          # Download Sparkle tools if not exists (in subshell to preserve cwd)
-          if [ ! -d "$SPARKLE_BIN" ]; then
+          # Download Sparkle tools if the signing executable is missing. A stale
+          # /tmp directory can exist without sign_update after partial extraction.
+          if [ ! -x "$SPARKLE_BIN/sign_update" ]; then
             echo "📥 Downloading Sparkle tools (v$SPARKLE_VERSION)..."
             (
               cd /tmp
-              curl -L https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz -o Sparkle-$SPARKLE_VERSION.tar.xz
-              rm -rf Sparkle-$SPARKLE_VERSION
+              rm -rf Sparkle-$SPARKLE_VERSION Sparkle-$SPARKLE_VERSION.tar.xz
+              curl -fL https://github.com/sparkle-project/Sparkle/releases/download/$SPARKLE_VERSION/Sparkle-$SPARKLE_VERSION.tar.xz -o Sparkle-$SPARKLE_VERSION.tar.xz
               mkdir Sparkle-$SPARKLE_VERSION
               cd Sparkle-$SPARKLE_VERSION
               tar -xf ../Sparkle-$SPARKLE_VERSION.tar.xz
             )
+
+            if [ ! -x "$SPARKLE_BIN/sign_update" ]; then
+              echo "❌ Error: Sparkle sign_update not found at $SPARKLE_BIN/sign_update"
+              echo "📋 Contents of $SPARKLE_BIN:"
+              ls -la "$SPARKLE_BIN" 2>/dev/null || true
+              exit 1
+            fi
             echo "✅ Sparkle tools downloaded"
           fi
           
@@ -409,6 +417,12 @@ jobs:
           
           if [ -z "$SPARKLE_SIGNATURE" ]; then
             echo "❌ Error: Failed to extract Sparkle signature from output"
+            exit 1
+          fi
+
+          if ! echo "$SPARKLE_SIGNATURE" | grep -Eq '^[A-Za-z0-9+/=]{80,}$'; then
+            echo "❌ Error: Invalid Sparkle signature format"
+            echo "Extracted value: $SPARKLE_SIGNATURE"
             exit 1
           fi
           

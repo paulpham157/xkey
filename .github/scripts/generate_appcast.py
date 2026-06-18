@@ -218,8 +218,14 @@ def generate_appcast_xml(repo: str, token: Optional[str] = None) -> str:
         ed_signature = fetch_signature(signature_asset, token)
         
         if not ed_signature:
-            print(f"Warning: No EdDSA signature found for release {release['tag_name']}", file=sys.stderr)
-            print(f"         Update validation will fail without signature!", file=sys.stderr)
+            print(f"Error: No EdDSA signature found for release {release['tag_name']}", file=sys.stderr)
+            print(f"       Refusing to generate an appcast that Sparkle cannot validate.", file=sys.stderr)
+            sys.exit(1)
+
+        if not re.fullmatch(r'[A-Za-z0-9+/=]{80,}', ed_signature):
+            print(f"Error: Invalid EdDSA signature format for release {release['tag_name']}", file=sys.stderr)
+            print(f"       Value: {ed_signature}", file=sys.stderr)
+            sys.exit(1)
         
         # Find and fetch version info from version.json
         version_asset = find_version_json_asset(release.get('assets', []))

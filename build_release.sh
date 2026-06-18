@@ -655,6 +655,7 @@ if [ "$ENABLE_NOTARIZE" = true ] && [ "$ENABLE_CODESIGN" = true ]; then
         echo "   - Unsigned nested code or frameworks"
         echo "   - Missing timestamp in signature"
         echo "   - Invalid entitlements"
+        exit 1
     fi
 fi
 
@@ -665,13 +666,24 @@ if [ "$ENABLE_SPARKLE_SIGN" = true ] && [ "$ENABLE_DMG" = true ] && [ -f "Releas
     echo ""
     echo "🔐 Sparkle Signing for Auto-Update..."
     
-    # Check if Sparkle tools exist
-    if [ ! -d "$SPARKLE_BIN" ]; then
+    # Check if Sparkle signing tool exists. The directory may exist from a
+    # previous failed/partial extraction, so validate the executable itself.
+    if [ ! -x "$SPARKLE_BIN/sign_update" ]; then
         echo "📥 Downloading Sparkle tools (v2.9.0)..."
-        curl -L https://github.com/sparkle-project/Sparkle/releases/download/2.9.0/Sparkle-2.9.0.tar.xz -o /tmp/Sparkle-2.9.0.tar.xz
-        rm -rf /tmp/Sparkle-2.9.0
+        rm -rf /tmp/Sparkle-2.9.0 /tmp/Sparkle-2.9.0.tar.xz
+        curl -fL https://github.com/sparkle-project/Sparkle/releases/download/2.9.0/Sparkle-2.9.0.tar.xz -o /tmp/Sparkle-2.9.0.tar.xz
         mkdir -p /tmp/Sparkle-2.9.0
-        tar -xf /tmp/Sparkle-2.9.0.tar.xz -C /tmp/Sparkle-2.9.0
+        (
+            cd /tmp/Sparkle-2.9.0
+            tar -xf ../Sparkle-2.9.0.tar.xz
+        )
+
+        if [ ! -x "$SPARKLE_BIN/sign_update" ]; then
+            echo "❌ Error: Sparkle sign_update not found at $SPARKLE_BIN/sign_update"
+            echo "   Contents of $SPARKLE_BIN:"
+            ls -la "$SPARKLE_BIN" 2>/dev/null || true
+            exit 1
+        fi
         echo "✅ Sparkle tools downloaded"
     fi
     
@@ -697,20 +709,20 @@ if [ "$ENABLE_SPARKLE_SIGN" = true ] && [ "$ENABLE_DMG" = true ] && [ -f "Releas
     fi
     
     # Sign DMG with EdDSA signature
-    # NOTE: sign_update may return non-zero exit code even on success,
-    # so we temporarily disable set -e to capture output and handle errors ourselves
     echo "🔏 Signing DMG with EdDSA key..."
     SPARKLE_KEY_FILE=$(mktemp)
     echo "$SPARKLE_PRIVATE_KEY" > "$SPARKLE_KEY_FILE"
+    chmod 600 "$SPARKLE_KEY_FILE"
     set +e
     SPARKLE_OUTPUT=$("$SPARKLE_BIN/sign_update" "Release/$DMG_NAME" --ed-key-file "$SPARKLE_KEY_FILE" 2>&1)
     SPARKLE_EXIT=$?
     set -e
     rm -f "$SPARKLE_KEY_FILE"
     
-    if [ $SPARKLE_EXIT -ne 0 ] && [ -z "$SPARKLE_OUTPUT" ]; then
+    if [ $SPARKLE_EXIT -ne 0 ]; then
         echo "❌ Error: sign_update failed with exit code $SPARKLE_EXIT"
-        echo "   Output: $SPARKLE_OUTPUT"
+        echo "   Output:"
+        echo "$SPARKLE_OUTPUT"
         exit 1
     fi
     
@@ -730,6 +742,16 @@ if [ "$ENABLE_SPARKLE_SIGN" = true ] && [ "$ENABLE_DMG" = true ] && [ -f "Releas
     if [ -z "$SPARKLE_SIGNATURE" ]; then
         echo "❌ Error: Failed to generate Sparkle signature"
         echo "   Output from sign_update:"
+        echo "$SPARKLE_OUTPUT"
+        exit 1
+    fi
+
+    # Sparkle EdDSA signatures are base64. Reject shell errors or malformed text
+    # before they can be uploaded into appcast.xml.
+    if ! echo "$SPARKLE_SIGNATURE" | grep -Eq '^[A-Za-z0-9+/=]{80,}$'; then
+        echo "❌ Error: Invalid Sparkle signature format"
+        echo "   Extracted value: $SPARKLE_SIGNATURE"
+        echo "   Full sign_update output:"
         echo "$SPARKLE_OUTPUT"
         exit 1
     fi
