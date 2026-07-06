@@ -56,6 +56,11 @@ class XKeyIMController: IMKInputController {
     /// Examples: Warp terminal, some terminal emulators
     private var cursorTrackingBroken: Bool = false
     
+    // Mirror VNEngine upperCaseStatus for IMKit paths where marked-text/cursor
+    // bookkeeping can reset engine state before the next printable letter.
+    // 0 = none, 1 = punctuation seen, 2 = newline, 3 = punctuation + space seen
+    private var imUpperCaseStatus: UInt8 = 0
+    
     /// Last known client bundle ID, used to reset cursorTrackingBroken on app switch
     private var lastClientBundleId: String = ""
 
@@ -129,16 +134,23 @@ class XKeyIMController: IMKInputController {
         engineSettings.spellCheckEnabled = settings.spellCheckEnabled
 
         engineSettings.quickTelexEnabled = settings.quickTelexEnabled
+        engineSettings.quickStartConsonantEnabled = settings.quickStartConsonantEnabled
+        engineSettings.quickEndConsonantEnabled = settings.quickEndConsonantEnabled
         engineSettings.upperCaseFirstChar = settings.upperCaseFirstChar
         engineSettings.capitalizeOnlyAfterSpace = settings.capitalizeOnlyAfterSpace
 
         engineSettings.restoreIfWrongSpelling = settings.restoreIfWrongSpelling
         
-        // Parse custom consonants string into Set<UInt16> for engine
-        let customConsonantsStr = SharedSettings.shared.customConsonants
+        // Parse custom consonants string into Set<UInt16> for engine.
+        // Match the main app: only enable custom consonants when the option is on.
+        let customConsonantsStr = settings.customConsonantEnabled ? settings.customConsonants : ""
         engineSettings.customConsonants = VietnameseData.parseCustomConsonants(customConsonantsStr)
         
         engine.updateSettings(engineSettings)
+        
+        if !settings.upperCaseFirstChar {
+            imUpperCaseStatus = 0
+        }
     }
     
     /// Wire or unwire the engine log closure.
@@ -218,6 +230,34 @@ class XKeyIMController: IMKInputController {
             return false
         }
         return settings.useMarkedText
+    }
+    
+    private func updateIMUpperCaseStatus(character: Character) {
+        guard settings.upperCaseFirstChar else { return }
+        if character == "." || character == "?" || character == "!" {
+            imUpperCaseStatus = 1
+        } else if character == "\n" || character == "\r" {
+            imUpperCaseStatus = 2
+        } else if character == " " {
+            if imUpperCaseStatus == 1 {
+                imUpperCaseStatus = 3
+            }
+        } else {
+            imUpperCaseStatus = 0
+        }
+    }
+    
+    private func shouldAutoCapitalizeNextLetter(_ character: Character) -> Bool {
+        guard settings.upperCaseFirstChar, character.isLetter else { return false }
+        let shouldCapitalize = settings.capitalizeOnlyAfterSpace
+            ? (imUpperCaseStatus == 2 || imUpperCaseStatus == 3)
+            : (imUpperCaseStatus >= 1)
+        imUpperCaseStatus = 0
+        return shouldCapitalize
+    }
+    
+    private func resetIMUpperCaseStatus() {
+        imUpperCaseStatus = 0
     }
     
     /// Handle keyboard events
@@ -308,6 +348,10 @@ class XKeyIMController: IMKInputController {
                 }
             }
             
+            // Do NOT reset imUpperCaseStatus here.
+            // IMKit can report false-positive cursor/desync between punctuation,
+            // space, and the next letter. The local auto-cap state exists exactly
+            // to survive those resets.
             engine.resetWithCursorMoved()
             composingText = ""
             currentWordLength = 0
@@ -330,6 +374,7 @@ class XKeyIMController: IMKInputController {
         if effectiveUseMarkedText && composingText.isEmpty && !engineWord.isEmpty {
             // DEBUG: Log desync detection
             IMKitDebugger.shared.log("DESYNC detected! composingText empty but engine has '\(engineWord)'. Resetting.", category: "CURSOR")
+            // Do NOT reset imUpperCaseStatus here; see cursorMoved block above.
             engine.resetWithCursorMoved()
             currentWordLength = 0
         }
@@ -381,6 +426,7 @@ class XKeyIMController: IMKInputController {
             // After Cmd+A, user expects to start fresh typing, not continue previous word
             commitComposition(client)
             engine.reset()
+            resetIMUpperCaseStatus()
             currentWordLength = 0
             return false
         }
@@ -394,6 +440,7 @@ class XKeyIMController: IMKInputController {
             
             commitComposition(client)
             engine.reset()
+            resetIMUpperCaseStatus()
             currentWordLength = 0
             markedTextStartLocation = NSNotFound
             
@@ -436,6 +483,7 @@ class XKeyIMController: IMKInputController {
             // upperCaseStatus, so it must come before updateUpperCaseStatus("\n").
             engine.resetWithCursorMoved()  // Enter moves cursor to new line
             engine.updateUpperCaseStatus(character: "\n")
+            updateIMUpperCaseStatus(character: "\n")
             currentWordLength = 0
             markedTextStartLocation = NSNotFound
             
@@ -448,6 +496,7 @@ class XKeyIMController: IMKInputController {
         case 0x30: // Tab
             commitComposition(client)
             engine.resetWithCursorMoved()  // Tab moves cursor
+            resetIMUpperCaseStatus()
             currentWordLength = 0
             markedTextStartLocation = NSNotFound
             return false
@@ -464,11 +513,13 @@ class XKeyIMController: IMKInputController {
             if !composingText.isEmpty {
                 commitComposition(client)
                 engine.resetWithCursorMoved()
+                resetIMUpperCaseStatus()
                 currentWordLength = 0
                 markedTextStartLocation = NSNotFound
             } else {
                 // No composition, but still mark cursor as moved
                 engine.resetWithCursorMoved()
+                resetIMUpperCaseStatus()
             }
             return false // Let navigation key pass through
 
@@ -556,12 +607,14 @@ class XKeyIMController: IMKInputController {
                 currentWordLength = 0
                 markedTextStartLocation = NSNotFound
                 engine.reset()
+                resetIMUpperCaseStatus()
                 return true  // Consume ESC - don't pass through yet
             } else {
                 // No content - let ESC pass through to application
                 // This allows Spotlight and other apps to close with ESC
                 IMKitDebugger.shared.log("ESC - no content, passing through", category: "ESC")
                 engine.reset()  // Reset engine state just in case
+                resetIMUpperCaseStatus()
                 return false
             }
 
@@ -611,10 +664,25 @@ class XKeyIMController: IMKInputController {
                 // Calling reset() would clear history and spaceCount, breaking backspace restore
                 currentWordLength = 0
                 markedTextStartLocation = NSNotFound
+                // Predict cursor after the system inserts the space. Without this,
+                // the next key can look like an unexpected cursor move and clear
+                // pending auto-capitalize state from the engine.
+                let currentSelection = client.selectedRange()
+                if currentSelection.location != NSNotFound {
+                    lastKnownSelectionLocation = currentSelection.location + 1
+                }
             } else {
-                // No composing text or tracked word - just let space pass through
-                // Don't reset engine - there's nothing to reset and we want to preserve history
+                // No composing text or tracked word - just let space pass through.
+                // Match main app behavior: even with an empty buffer, Space after
+                // sentence-ending punctuation must upgrade upperCaseStatus from
+                // "punctuation seen" to "punctuation + space seen".
+                engine.updateUpperCaseStatus(character: " ")
+                updateIMUpperCaseStatus(character: " ")
                 currentWordLength = 0
+                let currentSelection = client.selectedRange()
+                if currentSelection.location != NSNotFound {
+                    lastKnownSelectionLocation = currentSelection.location + 1
+                }
             }
             return false // Let space pass through
             
@@ -664,6 +732,7 @@ class XKeyIMController: IMKInputController {
             // This saves current word to history and tracks the special character
             // so backspace can restore the word correctly
             _ = engine.processWordBreak(character: character)
+            updateIMUpperCaseStatus(character: character)
             
             // CRITICAL FIX: Insert the special character ourselves
             // Don't rely on "return false" which may cause the character to be lost
@@ -673,17 +742,23 @@ class XKeyIMController: IMKInputController {
                 replacementRange: NSRange(location: NSNotFound, length: 0)
             )
             
+            let currentSelection = client.selectedRange()
+            if currentSelection.location != NSNotFound {
+                lastKnownSelectionLocation = currentSelection.location + 1
+            }
+            
             return true  // We handled it - don't let system insert again
         }
 
         // Process through Vietnamese engine
         // Pass the original character so engine can detect tone marks correctly
         // The isUppercase flag tells engine when to apply capitalization
-        IMKitDebugger.shared.log("BEFORE engine.processKey: char='\(character)' keyCode=0x\(String(keyCode, radix: 16)) isUpper=\(isUppercase)", category: "ENGINE")
+        let effectiveIsUppercase = isUppercase || shouldAutoCapitalizeNextLetter(baseChar)
+        IMKitDebugger.shared.log("BEFORE engine.processKey: char='\(character)' keyCode=0x\(String(keyCode, radix: 16)) isUpper=\(effectiveIsUppercase)", category: "ENGINE")
         let result = engine.processKey(
             character: character,
             keyCode: keyCode,
-            isUppercase: isUppercase
+            isUppercase: effectiveIsUppercase
         )
         IMKitDebugger.shared.log("AFTER engine.processKey: shouldConsume=\(result.shouldConsume) bs=\(result.backspaceCount) newChars=\(result.newCharacters.count)", category: "ENGINE")
 
@@ -1305,15 +1380,21 @@ class XKeyIMSettings {
     
     // MARK: - Settings Properties
     
+    private static let defaultCustomConsonants = "Z,F,W,J"
+    
     var inputMethod: InputMethod = .telex
     var codeTable: CodeTable = .unicode
     var modernStyle: Bool = true
     var spellCheckEnabled: Bool = true
 
     var quickTelexEnabled: Bool = true
+    var quickStartConsonantEnabled: Bool = false
+    var quickEndConsonantEnabled: Bool = false
     var restoreIfWrongSpelling: Bool = true
     var upperCaseFirstChar: Bool = false
     var capitalizeOnlyAfterSpace: Bool = true
+    var customConsonantEnabled: Bool = false
+    var customConsonants: String = XKeyIMSettings.defaultCustomConsonants
     var useMarkedText: Bool = true  // Default to true - standard IMKit behavior
     var debugModeEnabled: Bool = false  // Controls whether XKeyIM writes to ~/XKey_Debug.log
     
@@ -1343,9 +1424,13 @@ class XKeyIMSettings {
         spellCheckEnabled = readBool(forKey: "XKey.spellCheckEnabled")
 
         quickTelexEnabled = readBool(forKey: "XKey.quickTelexEnabled", defaultValue: true)
+        quickStartConsonantEnabled = readBool(forKey: "XKey.quickStartConsonantEnabled")
+        quickEndConsonantEnabled = readBool(forKey: "XKey.quickEndConsonantEnabled")
         restoreIfWrongSpelling = readBool(forKey: "XKey.restoreIfWrongSpelling", defaultValue: true)
         upperCaseFirstChar = readBool(forKey: "XKey.upperCaseFirstChar")
         capitalizeOnlyAfterSpace = readBool(forKey: "XKey.capitalizeOnlyAfterSpace", defaultValue: true)
+        customConsonantEnabled = readBool(forKey: "XKey.customConsonantEnabled")
+        customConsonants = readString(forKey: "XKey.customConsonants") ?? XKeyIMSettings.defaultCustomConsonants
         
         // Use Marked Text
         let oldUseMarkedText = useMarkedText
@@ -1389,5 +1474,13 @@ class XKeyIMSettings {
             }
         }
         return defaultValue
+    }
+    
+    /// Read a String value from plist
+    private func readString(forKey key: String) -> String? {
+        if let dict = readPlistDict(), let value = dict[key] as? String {
+            return value
+        }
+        return nil
     }
 }
