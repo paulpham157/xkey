@@ -348,8 +348,11 @@ class XKeyIMController: IMKInputController {
                 }
             }
             
+            // Do NOT reset imUpperCaseStatus here.
+            // IMKit can report false-positive cursor/desync between punctuation,
+            // space, and the next letter. The local auto-cap state exists exactly
+            // to survive those resets.
             engine.resetWithCursorMoved()
-            resetIMUpperCaseStatus()
             composingText = ""
             currentWordLength = 0
             markedTextStartLocation = NSNotFound
@@ -371,8 +374,8 @@ class XKeyIMController: IMKInputController {
         if effectiveUseMarkedText && composingText.isEmpty && !engineWord.isEmpty {
             // DEBUG: Log desync detection
             IMKitDebugger.shared.log("DESYNC detected! composingText empty but engine has '\(engineWord)'. Resetting.", category: "CURSOR")
+            // Do NOT reset imUpperCaseStatus here; see cursorMoved block above.
             engine.resetWithCursorMoved()
-            resetIMUpperCaseStatus()
             currentWordLength = 0
         }
 
